@@ -1071,6 +1071,11 @@ pub(super) struct OutputDimensions {
     pub width: i32,
     pub height: i32,
     rotated_90: bool,
+    /// The host compositor's xdg_output logical size, used instead of the
+    /// device-pixel mode size in logical geometry mode.
+    logical: Option<(i32, i32)>,
+    /// Refresh of the current mode, for restating the mode at logical size.
+    refresh: i32,
 }
 
 impl Default for OutputDimensions {
@@ -1089,6 +1094,8 @@ impl Default for OutputDimensions {
             width: 0,
             height: 0,
             rotated_90: false,
+            logical: None,
+            refresh: 0,
         }
     }
 }
