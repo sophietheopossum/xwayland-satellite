@@ -116,6 +116,8 @@ pub struct SurfaceData {
     pub viewport: Option<Viewport>,
     pub moving: bool,
     pub resizing: Option<xdg_toplevel::ResizeEdge>,
+    /// Outputs the surface has been sent wl_surface.enter for.
+    pub entered: Vec<WlOutput>,
 }
 
 impl SurfaceData {
@@ -880,8 +882,37 @@ impl Server {
     }
 
     pub fn move_surface_to_output(&mut self, surface: SurfaceId, output: &WlOutput) {
-        let data = self.state.surfaces.get(&surface).expect("No such surface");
-        data.surface.enter(output);
+        let data = self
+            .state
+            .surfaces
+            .get_mut(&surface)
+            .expect("No such surface");
+        // Real compositors send wl_surface.leave for outputs a moved surface
+        // is no longer on; model that so output-anchoring logic in the
+        // client under test behaves as it would in production.
+        let already_entered = data.entered
+            .iter()
+            .any(
+                |o| o.id() == output.id()
+            );
+        for old in std::mem::take(
+            &mut data.entered,
+        ) {
+            if old.id() != output.id() {
+                data.surface
+                    .leave(
+                        &old,
+                    );
+            }
+        }
+        if !already_entered {
+            data.surface.enter(output);
+        }
+        data.entered
+            .push(
+                output
+                    .clone()
+            );
         self.display.flush_clients().unwrap();
     }
 
@@ -1955,6 +1986,7 @@ impl Dispatch<WlCompositor, ()> for State {
                         viewport: None,
                         moving: false,
                         resizing: None,
+                        entered: Vec::new(),
                     },
                 );
                 state.last_surface_id = Some(SurfaceId(id));
