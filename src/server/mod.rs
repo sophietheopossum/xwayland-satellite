@@ -483,6 +483,15 @@ pub struct InnerServerState<S: X11Selection> {
     global_offset_updated: bool,
     updated_outputs: Vec<Entity>,
     new_scale: Option<f64>,
+    /// Present X11 with the compositor's logical coordinate space instead of
+    /// device pixels: outputs advertise their xdg_output logical size as both
+    /// mode and logical size, output/surface scale factors stay pinned at 1,
+    /// and windows are sized in logical pixels. This keeps X11 window geometry
+    /// and pointer input consistent on mixed-scale multi-monitor layouts, at
+    /// the cost of upscale softness on outputs with scale > 1 (X11 has a
+    /// single coordinate space; it cannot be per-output crisp AND
+    /// geometrically consistent). Enabled by XWLS_LOGICAL_GEOMETRY=1.
+    logical_geometry: bool,
 }
 
 impl<S: X11Selection> ServerState<NoConnection<S>> {
@@ -591,9 +600,16 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             global_offset_updated: false,
             updated_outputs: Vec::new(),
             new_scale: None,
+            logical_geometry: std::env::var("XWLS_LOGICAL_GEOMETRY")
+                .is_ok_and(|v| !v.is_empty() && v != "0"),
             decoration_manager,
             world,
         };
+        if inner.logical_geometry {
+            log::info!(
+                "XWLS_LOGICAL_GEOMETRY set: presenting X11 with logical output geometry"
+            );
+        }
         Self {
             inner,
             connection: NoConnection {
