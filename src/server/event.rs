@@ -206,27 +206,43 @@ impl SurfaceEvents {
                 };
 
                 surface.enter(&output);
-                let on_output = OnOutput(output_entity);
 
                 debug!("{} entered {}", surface.id(), output.id());
 
+                // Track every output the surface is on. The anchor
+                // (OnOutput) only changes when its output actually leaves:
+                // re-anchoring on every enter turns transient overlaps
+                // (bounding-box sweeps during animations, brief flickers on
+                // layout changes) into X11 repositioning feedback loops.
+                match data.get::<&mut EnteredOutputs>() {
+                    Some(mut entered) => {
+                        entered.0.retain(|e| *e != output_entity);
+                        entered.0.push(output_entity);
+                    }
+                    None => cmd.insert_one(target, EnteredOutputs(vec![output_entity])),
+                }
+
+                let anchor_is_valid = data.get::<&OnOutput>().is_some_and(|o| {
+                    state
+                        .world
+                        .entity(o.0)
+                        .is_ok_and(|e| e.has::<OutputDimensions>())
+                });
+
                 let mut query = data.query::<(&x::Window, &mut WindowData)>();
                 if let Some((window, win_data)) = query.get() {
-                    let Some(dimensions) = output_data.get::<&OutputDimensions>() else {
-                        return;
-                    };
-                    win_data.update_output_offset(
-                        *window,
-                        WindowOutputOffset {
-                            x: dimensions.x - state.global_output_offset.x.value,
-                            y: dimensions.y - state.global_output_offset.y.value,
-                        },
-                        connection,
-                    );
-                    if state.last_focused_toplevel == Some(*window) {
-                        let output = get_output_name(Some(&on_output), &state.world);
-                        debug!("focused window changed outputs - resetting primary output");
-                        connection.focus_window(*window, output);
+                    if !anchor_is_valid
+                        && anchor_window_to_output(
+                            &state.world,
+                            *window,
+                            win_data,
+                            output_entity,
+                            &state.global_output_offset,
+                            state.last_focused_toplevel,
+                            connection,
+                        )
+                    {
+                        cmd.insert_one(target, OnOutput(output_entity));
                     }
 
                     if state.fractional_scale.is_none() {
