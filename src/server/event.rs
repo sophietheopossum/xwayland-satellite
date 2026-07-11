@@ -1001,6 +1001,12 @@ impl Event for client::wl_touch::Event {
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) struct OnOutput(pub Entity);
+
+/// Every output a surface is currently on, in enter order (most recent last).
+/// [`OnOutput`] is the surface's positioning anchor; this set decides where to
+/// re-anchor when the anchor output itself leaves.
+pub(super) struct EnteredOutputs(Vec<Entity>);
+
 struct OutputName(String);
 fn get_output_name(output: Option<&OnOutput>, world: &World) -> Option<String> {
     output.map(|o| world.get::<&OutputName>(o.0).unwrap().0.clone())
