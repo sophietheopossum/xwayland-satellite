@@ -72,6 +72,13 @@ Prints a basic usage message and list of accepted flags and returns 0.
 \fB\-listen\fR
 Enable a transport mechanism. This option can be used multiple times to enable multiple transport mechanisms. This option overrides a previous \fB\-nolisten\fR sent with the same parameter.
 .TP
+\fB\-\-logical\-geometry\fR
+Present X11 clients with the compositor's logical coordinate space instead of device pixels: outputs are advertised at their logical size with scale 1, and X11 windows are sized in logical pixels. This keeps X11 window geometry and pointer input consistent on multi-monitor layouts with mixed output scales, at the cost of upscale softness on outputs with a scale greater than 1. This option is specific to
+.B xwayland\-satellite
+and is not forwarded to Xwayland. It can also be enabled by setting the
+.B XWLS_LOGICAL_GEOMETRY
+environment variable to a non-empty value other than 0, for setups where the command line cannot be changed.
+.TP
 \fB\-nolisten\fR
 Disable a transport mechanism. This option can be used multiple times to disable multiple transport mechanisms. This option overrides a previous \fB\-listen\fR sent with the same parameter.
 .TP
