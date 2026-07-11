@@ -51,6 +51,11 @@ pub trait RunData {
     fn max_req_len_bytes(&self) -> Option<usize> {
         None
     }
+    /// Present X11 clients with the compositor's logical coordinate space
+    /// instead of device pixels. See `ServerState::logical_geometry`.
+    fn logical_geometry(&self) -> bool {
+        false
+    }
 }
 
 pub const fn timespec_from_millis(millis: u64) -> Timespec {
@@ -153,7 +158,15 @@ pub fn main(mut data: impl RunData) -> Option<()> {
         }
     };
 
-    let mut server_state = EarlyServerState::new(dh, data.server(), connection);
+    let logical_geometry = data
+        .logical_geometry();
+    let mut server_state = EarlyServerState::new(
+        dh,
+        data
+            .server(),
+        connection,
+        logical_geometry,
+    );
     server_state.run();
 
     // Remove the lifetimes on our fds to avoid borrowing issues, since we know they will exist for

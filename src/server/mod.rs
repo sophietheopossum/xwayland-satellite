@@ -490,7 +490,8 @@ pub struct InnerServerState<S: X11Selection> {
     /// and pointer input consistent on mixed-scale multi-monitor layouts, at
     /// the cost of upscale softness on outputs with scale > 1 (X11 has a
     /// single coordinate space; it cannot be per-output crisp AND
-    /// geometrically consistent). Enabled by XWLS_LOGICAL_GEOMETRY=1.
+    /// geometrically consistent). Enabled by the --logical-geometry flag or
+    /// XWLS_LOGICAL_GEOMETRY=1.
     logical_geometry: bool,
 }
 
@@ -499,6 +500,7 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
         mut dh: DisplayHandle,
         server_connection: Option<UnixStream>,
         client: UnixStream,
+        logical_geometry: bool,
     ) -> Self {
         let connection = if let Some(stream) = server_connection {
             Connection::from_socket(stream).unwrap()
@@ -600,14 +602,14 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             global_offset_updated: false,
             updated_outputs: Vec::new(),
             new_scale: None,
-            logical_geometry: std::env::var("XWLS_LOGICAL_GEOMETRY")
-                .is_ok_and(|v| !v.is_empty() && v != "0"),
+            logical_geometry,
             decoration_manager,
             world,
         };
         if inner.logical_geometry {
             log::info!(
-                "XWLS_LOGICAL_GEOMETRY set: presenting X11 with logical output geometry"
+                "logical geometry enabled:\
+                presenting X11 with logical output geometry"
             );
         }
         Self {

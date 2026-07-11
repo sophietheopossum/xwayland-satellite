@@ -13,6 +13,7 @@ struct RealData {
     display: Option<String>,
     listenfds: Vec<OwnedFd>,
     flags: Vec<String>,
+    logical_geometry: bool,
 }
 impl xwayland_satellite::RunData for RealData {
     fn display(&self) -> Option<&str> {
@@ -25,6 +26,10 @@ impl xwayland_satellite::RunData for RealData {
 
     fn flags(&self) -> &[String] {
         &self.flags
+    }
+
+    fn logical_geometry(&self) -> bool {
+        self.logical_geometry
     }
 }
 
@@ -179,6 +184,10 @@ fn parse_args() -> RealData {
                     "-glamor [gl|es|none]"
                 );
                 println!("{:<25} prints message with these options", "-help");
+                println!(
+                    "{:<25} present X11 clients with logical (scale-independent) output geometry; also enabled by XWLS_LOGICAL_GEOMETRY=1",
+                    "--logical-geometry"
+                );
                 println!("{:<25} listen on protocol", "-listen");
                 println!("{:<25} don't listen on protocol", "-nolisten");
                 println!("{:<25} add given fd as a listen socket", "-listenfd");
@@ -224,6 +233,9 @@ fn parse_args() -> RealData {
                 let fd = unsafe { OwnedFd::from_raw_fd(fd) };
                 data.listenfds.push(fd);
             }
+            "--logical-geometry" => {
+                data.logical_geometry = true;
+            }
             "--test-listenfd-support" => std::process::exit(0),
             "-verbose" => {
                 if let Some(v) = args.peek().and_then(|n| n.parse::<u32>().ok()) {
@@ -243,6 +255,14 @@ fn parse_args() -> RealData {
         }
     }
     data.flags = flags.to_vec();
+
+    // The environment variable is an alternative to --logical-geometry for
+    // setups where the satellite command line cannot be changed (e.g. a
+    // compositor spawning satellite with a fixed argument list).
+    if !data.logical_geometry {
+        data.logical_geometry = std::env::var("XWLS_LOGICAL_GEOMETRY")
+            .is_ok_and(|v| !v.is_empty() && v != "0");
+    }
 
     data
 }
