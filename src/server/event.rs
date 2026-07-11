@@ -1092,6 +1092,50 @@ impl Default for OutputDimensions {
     }
 }
 
+/// Point a window's X11 position at `output_entity`, resetting the X11
+/// primary output if the window is focused. Returns false if the output's
+/// dimensions aren't known yet (no anchoring possible).
+fn anchor_window_to_output<C: XConnection>(
+    world: &World,
+    window: x::Window,
+    win_data: &mut WindowData,
+    output_entity: Entity,
+    global_output_offset: &GlobalOutputOffset,
+    last_focused_toplevel: Option<x::Window>,
+    connection: &mut C,
+) -> bool {
+    let Ok(dimensions) = world.get::<&OutputDimensions>(output_entity) else {
+        return false;
+    };
+    win_data.update_output_offset(
+        window,
+        WindowOutputOffset {
+            x: dimensions.x - global_output_offset.x.value,
+            y: dimensions.y - global_output_offset.y.value,
+        },
+        connection,
+    );
+    if last_focused_toplevel == Some(
+        window
+    ) {
+        debug!("focused window changed outputs - resetting primary output");
+        let name = get_output_name(
+            Some(
+                &OnOutput(
+                    output_entity
+                )
+            ), 
+            world,
+        );
+        connection
+            .focus_window(
+                window, 
+                name, 
+            );
+    }
+    true
+}
+
 fn update_output_offset(
     output: Entity,
     source: OutputDimensionsSource,
