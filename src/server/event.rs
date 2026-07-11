@@ -102,6 +102,13 @@ impl Event for SurfaceEvents {
                         factor
                     );
 
+                    if state.logical_geometry {
+                        // Surfaces stay at scale 1 in logical geometry mode:
+                        // X11 windows are sized in logical pixels and the
+                        // compositor scales them at composite time.
+                        return;
+                    }
+
                     entity.get::<&mut SurfaceScaleFactor>().unwrap().0 = factor;
 
                     if let Some(OnOutput(output)) = entity.get::<&OnOutput>().as_deref().copied() {
@@ -1260,6 +1267,7 @@ impl OutputEvent {
                 model,
                 transform,
             } => {
+                let logical_geometry = state.logical_geometry;
                 update_output_offset(
                     target,
                     OutputDimensionsSource::Wl {
@@ -1307,10 +1315,36 @@ impl OutputEvent {
                     )
                 });
                 if let Some(xdg) = xdg {
-                    if dimensions.rotated_90 {
-                        xdg.logical_size(dimensions.height, dimensions.width);
-                    } else {
-                        xdg.logical_size(dimensions.width, dimensions.height);
+                    match dimensions.logical {
+                        // The host's logical size is already post-transform;
+                        // no rotation swap needed.
+                        Some(
+                            
+                            (
+                                width, 
+                                height,
+                            )
+                        ) if logical_geometry => {
+                            xdg
+                                .logical_size(
+                                    width, 
+                                    height,
+                                );
+                        }
+                        _ if dimensions.rotated_90 => {
+                            xdg
+                                .logical_size(
+                                    dimensions.height, 
+                                    dimensions.width,
+                                );
+                        }
+                        _ => {
+                            xdg
+                                .logical_size(
+                                    dimensions.width,
+                                    dimensions.height,
+                                );
+                        }
                     }
                 }
             }
@@ -1320,6 +1354,7 @@ impl OutputEvent {
                 height,
                 refresh,
             } => {
+                let logical_geometry = state.logical_geometry;
                 let Ok((output, dimensions)) = state
                     .world
                     .query_one_mut::<(&WlOutput, &mut OutputDimensions)>(target)
@@ -1333,15 +1368,47 @@ impl OutputEvent {
                 {
                     dimensions.width = width;
                     dimensions.height = height;
+                    dimensions.refresh = refresh;
                     debug!("{} dimensions: {width}x{height}", output.id());
                 }
-                output.mode(convert_wenum(flags), width, height, refresh);
+                // In logical geometry mode the mode is advertised at the
+                // output's logical size, so the X11 screen layout matches
+                // the compositor's logical coordinate space. Until
+                // xdg_output reports the logical size, the raw mode is
+                // forwarded and corrected once LogicalSize arrives.
+                let (
+                    mode_width, 
+                    mode_height,
+                ) = match dimensions.logical {
+                    Some(logical) if logical_geometry => logical,
+                    _ => (
+                        width, 
+                        height,
+                    ),
+                };
+                output
+                    .mode(
+                        convert_wenum(flags),
+                        mode_width, 
+                        mode_height, 
+                        refresh,
+                    );
             }
             Event::Scale { factor } => {
                 debug!(
                     "{} scale: {factor}",
                     state.world.get::<&WlOutput>(target).unwrap().id()
                 );
+                if state.logical_geometry {
+                    // The output keeps its default OutputScaleFactor of 1,
+                    // and X11 is explicitly told the world is unscaled.
+                    state.world.get::<&WlOutput>(
+                        target,
+                    )
+                        .unwrap()
+                        .scale(1);
+                    return;
+                }
                 if update_output_scale(
                     state.world.query_one(target).unwrap(),
                     OutputScaleFactor::Output(factor),
@@ -1391,14 +1458,52 @@ impl OutputEvent {
                         );
                 }
             }
-            Event::LogicalSize { .. } => {
-                let Ok((xdg, dimensions)) = state
+            Event::LogicalSize {
+                width, 
+                height,
+            } => {
+                let logical_geometry = state.logical_geometry;
+                let Ok(
+                    (
+                        xdg, 
+                        dimensions,
+                        output,
+                    )
+                ) = state
                     .world
-                    .query_one_mut::<(&XdgOutputServer, &OutputDimensions)>(target)
+                    .query_one_mut::<(
+                        &XdgOutputServer,
+                        &mut OutputDimensions,
+                        &WlOutput,
+                    )>(target)
                 else {
                     return;
                 };
-                if dimensions.rotated_90 {
+                if logical_geometry {
+                    // Pass the compositor's logical size straight through
+                    // (it is already post-transform), and restate the
+                    // current mode at the logical size so the X11 screen
+                    // layout agrees with it.
+                    dimensions.logical = Some(
+                        (
+                            width,
+                            height,
+                        )
+                    );
+                    xdg
+                        .logical_size(
+                            width,
+                            height,
+                        );
+                    if dimensions.refresh != 0 {
+                        output.mode(
+                            wayland_server::protocol::wl_output::Mode::Current,
+                            width,
+                            height,
+                            dimensions.refresh,
+                        );
+                    }
+                } else if dimensions.rotated_90 {
                     xdg.logical_size(dimensions.height, dimensions.width);
                 } else {
                     xdg.logical_size(dimensions.width, dimensions.height);
