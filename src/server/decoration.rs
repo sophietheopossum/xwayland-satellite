@@ -55,7 +55,23 @@ impl Drop for DecorationsDataSatellite {
 }
 
 impl DecorationsDataSatellite {
-    pub const TITLEBAR_HEIGHT: i32 = 25;
+    pub fn calculate_titlebar_height() -> i32 {
+        let px_scale = match FONT.pt_to_px_scale(10.0) {
+            Some(scale) => scale,
+            None => {
+                warn!("Failed to calculate titlebar font scale; using 25px fallback");
+                return 25;
+            }
+        };
+        let font = FONT.as_scaled(px_scale);
+        let line_height = font.ascent() - font.descent() + font.line_gap();
+        let padding = 12.0;
+        (line_height + padding).round() as i32
+    }
+
+    pub fn titlebar_height(&self) -> i32 {
+        Self::calculate_titlebar_height()
+    }
 
     pub fn try_new(
         state: &InnerServerState<impl X11Selection>,
@@ -88,7 +104,8 @@ impl DecorationsDataSatellite {
                 .subcompositor
                 .get_subsurface(&surface, parent, &state.qh, ())
         };
-        subsurface.set_position(0, -Self::TITLEBAR_HEIGHT);
+        let start_height = Self::calculate_titlebar_height();
+        subsurface.set_position(0, -start_height);
         let viewport = state.viewporter.get_viewport(&surface, &state.qh, ());
 
         Some((
@@ -154,8 +171,9 @@ impl DecorationsDataSatellite {
         }
 
         self.scale = parent_scale_factor;
+        let bar_h = self.titlebar_height();
         let mut drawn_width = (width as f32 * self.scale).ceil() as i32;
-        let drawn_height = (Self::TITLEBAR_HEIGHT as f32 * self.scale).ceil() as i32;
+        let drawn_height = (bar_h as f32 * self.scale).ceil() as i32;
 
         let x = x_pixmap(drawn_height as u32, self.scale, self.x_data.hovered);
         if x.width() > drawn_width as u32 {
@@ -197,18 +215,15 @@ impl DecorationsDataSatellite {
             None,
         );
         self.x_data = DecorationsBox {
-            rect: Rect::from_ltrb(
-                width as f32 - Self::TITLEBAR_HEIGHT as f32,
-                0.0,
-                width as f32,
-                Self::TITLEBAR_HEIGHT as f32,
-            )
-            .unwrap(),
+            rect: Rect::from_ltrb(width as f32 - bar_h as f32, 0.0, width as f32, bar_h as f32)
+                .unwrap(),
             hovered: false,
         };
 
         self.pixmap = bar;
-        self.viewport.set_destination(width, Self::TITLEBAR_HEIGHT);
+        self.viewport.set_destination(width, bar_h);
+        // re-sync subsurface position in case height changed since try_new (DPI hotplug)
+        self.subsurface.set_position(0, -bar_h);
         self.update_buffer(world);
     }
 
