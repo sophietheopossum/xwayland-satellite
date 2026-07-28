@@ -864,6 +864,15 @@ impl Server {
         self.display.flush_clients().unwrap();
     }
 
+    pub fn move_pointer_on_current_surface(&mut self, x: f64, y: f64) {
+        let pointer = self.state.pointer.as_ref().expect("No pointer created");
+        pointer
+            .pointer
+            .motion(self.state.begin.elapsed().as_millis() as u32, x, y);
+        pointer.pointer.frame();
+        self.display.flush_clients().unwrap();
+    }
+
     pub fn new_output(&mut self) {
         self.state.last_output_global = Some(self.dh.create_global::<State, WlOutput, _>(4, ()));
         self.display.flush_clients().unwrap();

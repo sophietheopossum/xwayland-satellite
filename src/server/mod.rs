@@ -48,7 +48,7 @@ use wayland_protocols::{
             zwp_tablet_pad_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2, zwp_tablet_v2,
         },
         tablet::zv2::server::zwp_tablet_manager_v2::ZwpTabletManagerV2,
-        viewporter::client::wp_viewporter::WpViewporter,
+        viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
     },
     xdg::{
         shell::client::{
@@ -245,6 +245,7 @@ struct PopupData {
     popup: XdgPopup,
     positioner: XdgPositioner,
     xdg: XdgSurfaceData,
+    parent: x::Window,
 }
 
 trait Event {
@@ -483,6 +484,8 @@ pub struct InnerServerState<S: X11Selection> {
     global_offset_updated: bool,
     updated_outputs: Vec<Entity>,
     new_scale: Option<f64>,
+    pub global_scale: f64,
+    pub compositor_scaling: bool,
 }
 
 impl<S: X11Selection> ServerState<NoConnection<S>> {
@@ -490,6 +493,7 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
         mut dh: DisplayHandle,
         server_connection: Option<UnixStream>,
         client: UnixStream,
+        compositor_scaling: bool,
     ) -> Self {
         let connection = if let Some(stream) = server_connection {
             Connection::from_socket(stream).unwrap()
@@ -591,6 +595,8 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             global_offset_updated: false,
             updated_outputs: Vec::new(),
             new_scale: None,
+            global_scale: 1.0,
+            compositor_scaling,
             decoration_manager,
             world,
         };
@@ -661,6 +667,9 @@ impl<C: XConnection> ServerState<C> {
             self.global_offset_updated = true;
         }
         if self.global_offset_updated {
+            let comp_scaling = self.compositor_scaling;
+            let glob_scale = self.global_scale;
+            recalculate_x11_output_positions(&mut self.world, comp_scaling, glob_scale);
             debug!(
                 target: "output_offset",
                 "updated global output offset: {}x{}",
@@ -673,64 +682,14 @@ impl<C: XConnection> ServerState<C> {
                     &state.global_output_offset,
                     &state.world,
                     &mut self.connection,
+                    state.global_scale,
+                    state.compositor_scaling,
                 );
             }
             self.global_offset_updated = false;
         }
 
-        if !self.updated_outputs.is_empty() {
-            for output in std::mem::take(&mut self.updated_outputs).iter() {
-                let Ok(output_scale) = self.world.get::<&OutputScaleFactor>(*output) else {
-                    continue;
-                };
-                if matches!(*output_scale, OutputScaleFactor::Output(..)) {
-                    let mut surface_query = self
-                        .world
-                        .query::<(&OnOutput, &mut SurfaceScaleFactor)>()
-                        .with::<(&WindowData, &WlSurface)>();
-
-                    let mut surfaces = vec![];
-                    for (surface, (OnOutput(s_output), surface_scale)) in surface_query.iter() {
-                        if s_output == output {
-                            surface_scale.0 = output_scale.get();
-                            surfaces.push(surface);
-                        }
-                    }
-
-                    drop(surface_query);
-                    for surface in surfaces {
-                        update_surface_viewport(
-                            &self.world,
-                            self.world.query_one(surface).unwrap(),
-                        );
-                    }
-                }
-            }
-
-            let mut mixed_scale = false;
-            let mut scale;
-
-            let mut outputs = self.world.query_mut::<&OutputScaleFactor>().into_iter();
-            if let Some((_, output_scale)) = outputs.next() {
-                scale = output_scale.get();
-
-                for (_, output_scale) in outputs {
-                    if output_scale.get() != scale {
-                        mixed_scale = true;
-                        scale = scale.min(output_scale.get());
-                    }
-                }
-
-                if mixed_scale {
-                    warn!(
-                        "Mixed output scales detected, choosing to give apps the smallest detected scale ({scale}x)"
-                    );
-                }
-
-                debug!("Using new scale {scale}");
-                self.new_scale = Some(scale);
-            }
-        }
+        self.update_compositor_scaling_state();
 
         {
             if let Some(FocusData {
@@ -800,6 +759,232 @@ impl<C: XConnection> ServerState<C> {
             self.last_hovered.take();
         }
     }
+
+    fn update_compositor_scaling_state(&mut self) {
+        let outputs_changed = !self.updated_outputs.is_empty();
+        if !self.updated_outputs.is_empty() {
+            for output in std::mem::take(&mut self.updated_outputs).iter() {
+                let Ok(output_scale) = self.world.get::<&OutputScaleFactor>(*output) else {
+                    continue;
+                };
+                let mut surface_query = self
+                    .world
+                    .query::<(&OnOutput, &mut SurfaceScaleFactor)>()
+                    .with::<(&WindowData, &WlSurface)>();
+
+                let mut surfaces = vec![];
+                for (surface, (OnOutput(s_output), surface_scale)) in surface_query.iter() {
+                    if s_output == output {
+                        let factor = if self.compositor_scaling {
+                            self.global_scale
+                        } else {
+                            output_scale.get()
+                        };
+                        surface_scale.0 = factor;
+                        surfaces.push(surface);
+                    }
+                }
+
+                drop(surface_query);
+                for surface in surfaces {
+                    update_surface_viewport(&self.world, self.world.query_one(surface).unwrap());
+                }
+            }
+
+            let mut mixed_scale = false;
+            let mut scale;
+            let use_compositor_scaling = self.compositor_scaling;
+
+            let mut outputs = self
+                .world
+                .query_mut::<&event::TrueOutputScaleFactor>()
+                .into_iter();
+            if let Some((_, output_scale)) = outputs.next() {
+                scale = output_scale.0.get();
+
+                for (_, output_scale) in outputs {
+                    if output_scale.0.get() != scale {
+                        mixed_scale = true;
+                        if use_compositor_scaling {
+                            scale = scale.max(output_scale.0.get());
+                        } else {
+                            scale = scale.min(output_scale.0.get());
+                        }
+                    }
+                }
+
+                if mixed_scale {
+                    warn!("Mixed output scales detected, choosing scale ({scale}x)");
+                }
+
+                let old_scale = self.global_scale;
+                debug!("Using new scale {scale}");
+                self.new_scale = Some(scale);
+                self.global_scale = scale;
+
+                if use_compositor_scaling && (old_scale != scale || outputs_changed) {
+                    let mut surface_query = self.world.query::<&mut SurfaceScaleFactor>().with::<(
+                        &WlSurface,
+                        &WindowData,
+                        &WpViewport,
+                    )>(
+                    );
+                    let mut surfaces = vec![];
+                    for (surface, surface_scale) in surface_query.iter() {
+                        surface_scale.0 = scale;
+                        surfaces.push(surface);
+                    }
+                    drop(surface_query);
+                    for surface in surfaces {
+                        let surface_query = self.world.query_one(surface).unwrap();
+                        update_surface_viewport(&self.world, surface_query);
+                        if let Ok(wl_surface) =
+                            self.world.get::<&client::wl_surface::WlSurface>(surface)
+                        {
+                            (*wl_surface).commit();
+                        }
+                    }
+
+                    let mut output_query = self
+                        .world
+                        .query::<&mut OutputScaleFactor>()
+                        .with::<&WlOutput>();
+                    let mut outputs = vec![];
+                    for (output, output_scale) in output_query.iter() {
+                        if *output_scale != OutputScaleFactor::Fractional(scale) {
+                            *output_scale = OutputScaleFactor::Fractional(scale);
+                            outputs.push(output);
+                        }
+                    }
+                    drop(output_query);
+                    for output in outputs {
+                        self.updated_outputs.push(output);
+                    }
+
+                    let comp_scaling = self.compositor_scaling;
+                    let glob_scale = self.global_scale;
+                    recalculate_x11_output_positions(
+                        &mut self.inner.world,
+                        comp_scaling,
+                        glob_scale,
+                    );
+
+                    let outputs_list: Vec<_> = self
+                        .inner
+                        .world
+                        .query::<&WlOutput>()
+                        .iter()
+                        .map(|(e, _)| e)
+                        .collect();
+                    for e in outputs_list {
+                        event::update_window_output_offsets(
+                            e,
+                            &self.inner.global_output_offset,
+                            &self.inner.world,
+                            &mut self.connection,
+                        );
+                    }
+
+                    for (output, (dimensions, server_output)) in self
+                        .world
+                        .query::<(&event::OutputDimensions, &WlOutput)>()
+                        .iter()
+                    {
+                        let (scaled_x, scaled_y) = if use_compositor_scaling {
+                            self.world
+                                .get::<&event::X11OutputPosition>(output)
+                                .ok()
+                                .map(|p| (p.x, p.y))
+                        } else {
+                            None
+                        }
+                        .unwrap_or_else(|| {
+                            (
+                                ((dimensions.x - self.global_output_offset.x.value) as f64 * scale)
+                                    .round() as i32,
+                                ((dimensions.y - self.global_output_offset.y.value) as f64 * scale)
+                                    .round() as i32,
+                            )
+                        });
+                        if let event::OutputDimensionsSource::Wl {
+                            physical_width,
+                            physical_height,
+                            subpixel,
+                            make,
+                            model,
+                            transform,
+                        } = &dimensions.source
+                        {
+                            server_output.geometry(
+                                scaled_x,
+                                scaled_y,
+                                (*physical_width as f64 * scale).round() as i32,
+                                (*physical_height as f64 * scale).round() as i32,
+                                convert_wenum(*subpixel),
+                                make.clone(),
+                                model.clone(),
+                                convert_wenum(*transform),
+                            );
+                        }
+                        server_output.mode(
+                            convert_wenum(dimensions.mode_flags),
+                            (dimensions.width as f64 * scale).round() as i32,
+                            (dimensions.height as f64 * scale).round() as i32,
+                            dimensions.refresh,
+                        );
+                        if self.fractional_scale.is_none() {
+                            server_output.scale(1);
+                        }
+                        server_output.done();
+
+                        if let Ok(xdg_server) = self.world.get::<&wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_v1::ZxdgOutputV1>(output) {
+                            xdg_server.logical_position(scaled_x, scaled_y);
+
+                            let (w, h) = if dimensions.rotated_90 {
+                                (dimensions.height, dimensions.width)
+                            } else {
+                                (dimensions.width, dimensions.height)
+                            };
+                            xdg_server.logical_size(
+                                (w as f64 * scale).round() as i32,
+                                (h as f64 * scale).round() as i32
+                            );
+                            xdg_server.done();
+                        }
+                    }
+                }
+            } else if use_compositor_scaling {
+                // drop back to 1.0 once the last output disappears
+                if self.global_scale != 1.0 {
+                    debug!("No outputs available, resetting global_scale to 1.0");
+                    self.global_scale = 1.0;
+                    self.new_scale = Some(1.0);
+
+                    let mut surface_query = self.world.query::<&mut SurfaceScaleFactor>().with::<(
+                        &WlSurface,
+                        &WindowData,
+                        &WpViewport,
+                    )>(
+                    );
+                    let mut surfaces = vec![];
+                    for (surface, surface_scale) in surface_query.iter() {
+                        surface_scale.0 = 1.0;
+                        surfaces.push(surface);
+                    }
+                    drop(surface_query);
+                    for surface in surfaces {
+                        let surface_query = self.world.query_one(surface).unwrap();
+                        update_surface_viewport(&self.world, surface_query);
+                        if let Ok(wl_surface) =
+                            self.world.get::<&client::wl_surface::WlSurface>(surface)
+                        {
+                            (*wl_surface).commit();
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl<S: X11Selection + 'static> InnerServerState<S> {
@@ -832,17 +1017,88 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             if *name == global {
                 self.updated_outputs.push(*entity);
                 self.world
-                    .remove::<(OutputScaleFactor, OutputDimensions)>(*entity)
+                    .remove::<(
+                        OutputScaleFactor,
+                        event::TrueOutputScaleFactor,
+                        OutputDimensions,
+                    )>(*entity)
                     .unwrap();
-                let query = self
+                let _ = self.world.remove_one::<event::X11OutputPosition>(*entity);
+
+                let mut surfaces_to_update = Vec::new();
+                for (e, (on_out, mut entered)) in self
                     .world
-                    .query_mut::<&OnOutput>()
-                    .into_iter()
-                    .map(|(e, on_out)| (e, *on_out))
-                    .collect::<Vec<_>>();
-                for (e, on_out) in query.iter() {
-                    if *on_out == OnOutput(*entity) {
-                        self.world.remove_one::<OnOutput>(*e).unwrap();
+                    .query_mut::<(Option<&mut OnOutput>, Option<&mut event::EnteredOutputs>)>()
+                {
+                    if let Some(ref mut entered) = entered {
+                        entered.0.retain(|&out| out != *entity);
+                    }
+                    if let Some(on_out) = on_out {
+                        if on_out.0 == *entity {
+                            // try another active output before clearing OnOutput
+                            let mut fallback = None;
+                            if let Some(ref entered) = entered {
+                                if let Some(&next_out) = entered.0.first() {
+                                    fallback = Some(next_out);
+                                }
+                            }
+                            if let Some(next_out) = fallback {
+                                *on_out = OnOutput(next_out);
+                                surfaces_to_update.push((e, next_out));
+                            } else {
+                                // clear OnOutput below if there is no fallback
+                                surfaces_to_update.push((e, hecs::Entity::DANGLING));
+                            }
+                        }
+                    }
+                }
+                for (e, next_out) in surfaces_to_update {
+                    if next_out == hecs::Entity::DANGLING {
+                        let _ = self.world.remove_one::<OnOutput>(e);
+                    } else {
+                        // update the offset without a ConfigureWindow during output removal;
+                        // some GTK/GDK clients crash if they query the CRTC mid-transition
+                        if let Ok(dimensions) = self.world.get::<&OutputDimensions>(next_out) {
+                            let (ox, oy) = if let Ok(pos) =
+                                self.world.get::<&event::X11OutputPosition>(next_out)
+                            {
+                                (pos.x, pos.y)
+                            } else {
+                                (
+                                    dimensions.x - self.global_output_offset.x.value,
+                                    dimensions.y - self.global_output_offset.y.value,
+                                )
+                            };
+                            if let Ok(mut win_query) = self.world.query_one::<&mut WindowData>(e) {
+                                if let Some(win_data) = win_query.get() {
+                                    let ox_diff = ox - win_data.output_offset.x;
+                                    let oy_diff = oy - win_data.output_offset.y;
+                                    win_data.attrs.dims.x += ox_diff as i16;
+                                    win_data.attrs.dims.y += oy_diff as i16;
+                                    win_data.output_offset = WindowOutputOffset { x: ox, y: oy };
+                                }
+                            }
+                        }
+
+                        self.updated_outputs.push(next_out);
+                        if let Ok(scale) = self.world.get::<&SurfaceScaleFactor>(e) {
+                            let scale_val = scale.0;
+                            let comp_scaling = self.compositor_scaling;
+                            let glob_scale = self.global_scale;
+                            if let Ok(out_query) = self.world.query_one::<(
+                                &mut OutputScaleFactor,
+                                &mut event::TrueOutputScaleFactor,
+                            )>(
+                                next_out
+                            ) {
+                                let _ = event::update_output_scale(
+                                    out_query,
+                                    OutputScaleFactor::Fractional(scale_val),
+                                    comp_scaling,
+                                    glob_scale,
+                                );
+                            }
+                        }
                     }
                 }
                 if self.global_output_offset.x.owner == Some(*entity) {
@@ -998,23 +1254,26 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             debug!("setting {window:?} hints {hints:?}");
             let mut query = data.query::<(&SurfaceRole, &SurfaceScaleFactor)>();
             if let Some((SurfaceRole::Toplevel(Some(data)), scale_factor)) = query.get() {
-                let decorations_height = if data.decoration.satellite.is_some() {
-                    DecorationsDataSatellite::TITLEBAR_HEIGHT
-                } else {
-                    0
-                };
+                let decorations_height = data
+                    .decoration
+                    .satellite
+                    .as_ref()
+                    .map(|s| s.titlebar_height())
+                    .unwrap_or(0);
                 if let Some(min_size) = &hints.min_size {
                     data.toplevel.set_min_size(
-                        (min_size.width as f64 / scale_factor.0) as i32,
-                        (min_size.height as f64 / scale_factor.0) as i32 + decorations_height,
+                        event::scale_size_to_logical(min_size.width as f64, scale_factor.0),
+                        event::scale_size_to_logical(min_size.height as f64, scale_factor.0)
+                            + decorations_height,
                     );
                 } else {
                     data.toplevel.set_min_size(0, 0);
                 }
                 if let Some(max_size) = &hints.max_size {
                     data.toplevel.set_max_size(
-                        (max_size.width as f64 / scale_factor.0) as i32,
-                        (max_size.height as f64 / scale_factor.0) as i32 + decorations_height,
+                        event::scale_size_to_logical(max_size.width as f64, scale_factor.0),
+                        event::scale_size_to_logical(max_size.height as f64, scale_factor.0)
+                            + decorations_height,
                     );
                 } else {
                     data.toplevel.set_max_size(0, 0);
@@ -1104,31 +1363,55 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             return;
         }
 
+        let transient_for = win.attrs.transient_for;
+        drop(win);
+
         if self.xdg_wm_base.version() < 3 {
             return;
         }
 
-        let mut query = data.query::<(&mut SurfaceRole, &SurfaceScaleFactor)>();
+        let mut query = data.query::<(&SurfaceRole, &SurfaceScaleFactor)>();
         let Some((role, scale_factor)) = query.get() else {
             return;
         };
 
         match role {
             SurfaceRole::Popup(Some(popup)) => {
+                let mut parent_dims = WindowDims::default();
+                let mut decorations_height = 0;
+                if let Some(parent) = transient_for {
+                    if let Some(&parent_entity) = self.windows.get(&parent) {
+                        if let Ok(parent_data) = self.world.get::<&WindowData>(parent_entity) {
+                            parent_dims = parent_data.attrs.dims;
+                            if let Ok(parent_role) = self.world.get::<&SurfaceRole>(parent_entity) {
+                                if let SurfaceRole::Toplevel(Some(toplevel)) = &*parent_role {
+                                    if let Some(ref sat) = toplevel.decoration.satellite {
+                                        decorations_height = sat.titlebar_height();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let rx = event.x() as i32 - parent_dims.x as i32;
+                let ry = event.y() as i32 - parent_dims.y as i32;
+                let ry_scaled =
+                    event::scale_pos_to_logical(ry as f64, scale_factor.0) - decorations_height;
                 popup.positioner.set_offset(
-                    ((event.x() as i32 - win.output_offset.x) as f64 / scale_factor.0) as i32,
-                    ((event.y() as i32 - win.output_offset.y) as f64 / scale_factor.0) as i32,
+                    event::scale_pos_to_logical(rx as f64, scale_factor.0),
+                    ry_scaled,
                 );
                 popup.positioner.set_size(
-                    1.max((event.width() as f64 / scale_factor.0) as i32),
-                    1.max((event.height() as f64 / scale_factor.0) as i32),
+                    event::scale_size_to_logical(event.width() as f64, scale_factor.0),
+                    event::scale_size_to_logical(event.height() as f64, scale_factor.0),
                 );
                 popup.popup.reposition(&popup.positioner, 0);
             }
             SurfaceRole::Toplevel(Some(_)) => {
+                drop(query);
+                let mut win = data.get::<&mut WindowData>().unwrap();
                 win.attrs.dims.width = dims.width;
                 win.attrs.dims.height = dims.height;
-                drop(query);
                 drop(win);
                 update_surface_viewport(&self.world, self.world.query_one(data.entity()).unwrap());
             }
@@ -1342,7 +1625,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
     pub fn destroy_window(&mut self, window: x::Window) {
         if let Some(id) = self.windows.remove(&window) {
             self.world.remove::<(x::Window, WindowData)>(id).unwrap();
-            if self.world.entity(id).unwrap().is_empty() {
+            let entity_ref = self.world.entity(id).unwrap();
+            if !entity_ref.has::<client::wl_surface::WlSurface>() {
                 self.world.despawn(id).unwrap();
             }
         }
@@ -1374,7 +1658,9 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
     fn calc_global_output_offset(&mut self) {
         self.global_output_offset.x.value = i32::MAX;
         self.global_output_offset.y.value = i32::MAX;
+        let mut has_outputs = false;
         for (entity, dimensions) in self.world.query_mut::<&OutputDimensions>() {
+            has_outputs = true;
             if dimensions.x < self.global_output_offset.x.value {
                 self.global_output_offset.x = GlobalOutputOffsetDimension {
                     owner: Some(entity),
@@ -1388,6 +1674,10 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 }
             }
         }
+        if !has_outputs {
+            self.global_output_offset.x.value = 0;
+            self.global_output_offset.y.value = 0;
+        }
     }
 
     /// Creates the appropriate xdg role (toplevel or popup) for the given window.
@@ -1396,6 +1686,22 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         let xdg_surface;
         let mut popup_for = None;
         let mut fullscreen = false;
+
+        if let Ok(data) = self.world.entity(entity) {
+            if let Some(window_data) = data.get::<&WindowData>() {
+                let guessed = event::guess_initial_scale(
+                    &self.world,
+                    window_data.attrs.dims,
+                    self.global_scale,
+                    self.compositor_scaling,
+                );
+                if let Ok(mut scale) = self.world.get::<&mut SurfaceScaleFactor>(entity) {
+                    if self.compositor_scaling {
+                        scale.0 = guessed;
+                    }
+                }
+            }
+        }
 
         {
             let data = self.world.entity(entity).unwrap();
@@ -1579,53 +1885,75 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
     }
 
     fn create_popup(&mut self, entity: Entity, xdg: XdgSurface, parent: x::Window) -> PopupData {
-        let mut query = self
-            .world
-            .query_one::<(&WindowData, &mut SurfaceScaleFactor)>(entity)
-            .unwrap();
+        let (window_dims, initial_scale, parent_dims, parent_surface, x_window, decorations_height) = {
+            let mut query = self
+                .world
+                .query_one::<(&mut WindowData, &mut SurfaceScaleFactor, &x::Window)>(entity)
+                .unwrap();
+            let (window, scale, x_window) = query.get().unwrap();
 
-        let (window, scale) = query.get().unwrap();
-        let mut parent_query = self
-            .world
-            .query_one::<(&WindowData, &SurfaceScaleFactor, &SurfaceRole)>(self.windows[&parent])
-            .unwrap();
-        let (parent_window, parent_scale, parent_role) = parent_query.get().unwrap();
-        let parent_dims = parent_window.attrs.dims;
-        let initial_scale = parent_scale.0;
-        *scale = *parent_scale;
+            let mut parent_query = self
+                .world
+                .query_one::<(&WindowData, &SurfaceScaleFactor, &SurfaceRole)>(
+                    self.windows[&parent],
+                )
+                .unwrap();
+            let (parent_window, parent_scale, parent_role) = parent_query.get().unwrap();
+
+            let parent_offset = parent_window.output_offset;
+            window.output_offset = parent_offset;
+            *scale = *parent_scale;
+
+            let decorations_height = if let SurfaceRole::Toplevel(Some(toplevel)) = parent_role {
+                toplevel
+                    .decoration
+                    .satellite
+                    .as_ref()
+                    .map(|s| s.titlebar_height())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            (
+                window.attrs.dims,
+                parent_scale.0,
+                parent_window.attrs.dims,
+                parent_role.xdg().unwrap().surface.clone(),
+                *x_window,
+                decorations_height,
+            )
+        };
 
         debug!(
             "creating popup ({:?}) {:?} {:?} {:?} {entity:?} (scale: {initial_scale})",
-            *self.world.get::<&x::Window>(entity).unwrap(),
+            x_window,
             parent,
-            window.attrs.dims,
+            window_dims,
             xdg.id()
         );
 
         let positioner = self.xdg_wm_base.create_positioner(&self.qh, ());
         positioner.set_size(
-            1.max((window.attrs.dims.width as f64 / initial_scale) as i32),
-            1.max((window.attrs.dims.height as f64 / initial_scale) as i32),
+            1.max((window_dims.width as f64 / initial_scale) as i32),
+            1.max((window_dims.height as f64 / initial_scale) as i32),
         );
-        let x = ((window.attrs.dims.x - parent_dims.x) as f64 / initial_scale) as i32;
-        let y = ((window.attrs.dims.y - parent_dims.y) as f64 / initial_scale) as i32;
+        let x = ((window_dims.x - parent_dims.x) as f64 / initial_scale) as i32;
+        let mut y = ((window_dims.y - parent_dims.y) as f64 / initial_scale) as i32;
+        y -= decorations_height;
         positioner.set_offset(x, y);
         positioner.set_anchor(Anchor::TopLeft);
         positioner.set_gravity(Gravity::BottomRight);
+        let parent_h = (parent_dims.height as f64 / initial_scale) as i32;
         positioner.set_anchor_rect(
             0,
             0,
-            (parent_window.attrs.dims.width as f64 / initial_scale) as i32,
-            (parent_window.attrs.dims.height as f64 / initial_scale) as i32,
+            (parent_dims.width as f64 / initial_scale) as i32,
+            parent_h,
         );
         positioner
             .set_constraint_adjustment(ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY);
-        let popup = xdg.get_popup(
-            Some(&parent_role.xdg().unwrap().surface),
-            &positioner,
-            &self.qh,
-            entity,
-        );
+        let popup = xdg.get_popup(Some(&parent_surface), &positioner, &self.qh, entity);
 
         PopupData {
             popup,
@@ -1635,6 +1963,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 configured: false,
                 pending: None,
             },
+            parent,
         }
     }
 }

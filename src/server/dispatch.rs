@@ -103,13 +103,22 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                 if buffer.is_none() {
                     trace!("xwayland attached null buffer to {client:?}");
                 }
-                let buffer = buffer.as_ref().map(|b| {
-                    let entity: Entity = b.data().copied().unwrap();
-                    state
-                        .world
-                        .get::<&client::wl_buffer::WlBuffer>(entity)
-                        .unwrap()
-                });
+                let buffer = if let Some(b) = buffer.as_ref() {
+                    let Some(entity) = b.data().copied() else {
+                        warn!("surface attach ignored: stale buffer");
+                        return;
+                    };
+
+                    let Some(buffer) = state.world.get::<&client::wl_buffer::WlBuffer>(entity).ok()
+                    else {
+                        warn!("surface attach ignored: stale buffer");
+                        return;
+                    };
+
+                    Some(buffer)
+                } else {
+                    None
+                };
 
                 if configured {
                     client.attach(buffer.as_deref(), x, y);
@@ -234,7 +243,12 @@ impl<S: X11Selection>
                         client,
                         server,
                         viewport,
-                        scale: SurfaceScaleFactor(1.0),
+                        scale: SurfaceScaleFactor(if state.compositor_scaling {
+                            state.global_scale
+                        } else {
+                            1.0
+                        }),
+                        entered_outputs: event::EnteredOutputs(Vec::new()),
                     },
                 );
                 if let Some(f) = fractional {
@@ -264,12 +278,18 @@ impl<S: X11Selection> Dispatch<WlBuffer, Entity> for InnerServerState<S> {
     ) {
         assert!(matches!(request, Request::<WlBuffer>::Destroy));
 
-        state
+        let Some(buffer) = state
             .world
             .get::<&client::wl_buffer::WlBuffer>(*entity)
-            .unwrap()
-            .destroy();
-        state.world.despawn(*entity).unwrap();
+            .ok()
+        else {
+            warn!("buffer destroy ignored: stale buffer");
+            return;
+        };
+
+        buffer.destroy();
+        drop(buffer);
+        let _ = state.world.despawn(*entity);
     }
 }
 
@@ -358,20 +378,31 @@ impl<S: X11Selection> Dispatch<WlPointer, Entity> for InnerServerState<S> {
                 hotspot_y,
                 surface,
             } => {
-                let c_pointer = state
+                let Some(c_pointer) = state
                     .world
                     .get::<&client::wl_pointer::WlPointer>(*entity)
-                    .unwrap();
+                    .ok()
+                else {
+                    warn!("set_cursor ignored: stale pointer");
+                    return;
+                };
 
-                let c_surface = surface.and_then(|s| {
-                    let e = s.data().copied()?;
-                    Some(
-                        state
-                            .world
-                            .get::<&client::wl_surface::WlSurface>(e)
-                            .unwrap(),
-                    )
-                });
+                let c_surface = if let Some(s) = surface {
+                    let Some(e) = s.data().copied() else {
+                        warn!("set_cursor ignored: stale cursor surface");
+                        return;
+                    };
+
+                    let Some(surface) = state.world.get::<&client::wl_surface::WlSurface>(e).ok()
+                    else {
+                        warn!("set_cursor ignored: stale cursor surface");
+                        return;
+                    };
+
+                    Some(surface)
+                } else {
+                    None
+                };
                 c_pointer.set_cursor(serial, c_surface.as_deref(), hotspot_x, hotspot_y);
             }
             Request::<WlPointer>::Release => {
@@ -421,13 +452,17 @@ impl<S: X11Selection> Dispatch<WlTouch, Entity> for InnerServerState<S> {
     ) {
         match request {
             Request::<WlTouch>::Release => {
-                state
-                    .world
-                    .get::<&client::wl_touch::WlTouch>(*entity)
-                    .unwrap()
-                    .release();
+                let Some(touch) = state.world.get::<&client::wl_touch::WlTouch>(*entity).ok()
+                else {
+                    warn!("touch release ignored: stale touch");
+                    return;
+                };
+
+                touch.release();
+                drop(touch);
+                let _ = state.world.remove_one::<event::TouchFocus>(*entity);
             }
-            _ => unreachable!(),
+            _ => warn!("unhandled touch request: {request:?}"),
         }
     }
 }
@@ -556,12 +591,22 @@ impl<S: X11Selection> Dispatch<WlOutput, Entity> for InnerServerState<S> {
     ) {
         match request {
             wayland_server::protocol::wl_output::Request::Release => {
-                state
+                let Some(output) = state
                     .world
                     .get::<&client::wl_output::WlOutput>(*entity)
-                    .unwrap()
-                    .release();
-                todo!("handle wloutput destruction");
+                    .ok()
+                else {
+                    warn!("output release ignored: stale output");
+                    return;
+                };
+
+                output.release();
+                drop(output);
+                // remove both sides: server binding is gone, client proxy is dead
+                let _ = state
+                    .world
+                    .remove_one::<client::wl_output::WlOutput>(*entity);
+                let _ = state.world.remove_one::<WlOutput>(*entity);
             }
             _ => warn!("unhandled output request {request:?}"),
         }
@@ -607,7 +652,7 @@ impl<S: X11Selection>
     fn request(
         state: &mut Self,
         _: &wayland_server::Client,
-        _: &s_dmabuf::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        s_params: &s_dmabuf::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
         request: <s_dmabuf::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1 as Resource>::Request,
         c_params: &c_dmabuf::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
         _: &DisplayHandle,
@@ -616,7 +661,10 @@ impl<S: X11Selection>
         use s_dmabuf::zwp_linux_buffer_params_v1::Request::*;
         match request {
             // TODO: Xwayland doesn't actually seem to use the Create request, and I don't feel like implementing it...
-            Create { .. } => todo!(),
+            Create { .. } => {
+                warn!("zwp_linux_buffer_params_v1.create is not implemented");
+                s_params.failed();
+            }
             CreateImmed {
                 buffer_id,
                 width,
@@ -889,17 +937,23 @@ impl<S: X11Selection> Dispatch<ConfinedPointerServer, Entity> for InnerServerSta
         _: &DisplayHandle,
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
-        let client = state.world.get::<&ConfinedPointerClient>(*entity).unwrap();
+        let Some(client) = state.world.get::<&ConfinedPointerClient>(*entity).ok() else {
+            warn!("confined pointer request ignored: stale ConfinedPointerClient");
+            return;
+        };
         simple_event_shunt! {
             client, request: cp::Request => [
                 SetRegion {
-                    |region| region.as_ref().map(|r| r.data().unwrap())
+                    |region| region.as_ref().and_then(|r| r.data().copied())
                 },
                 Destroy
             ]
         }
     }
 }
+
+#[derive(Clone, Copy)]
+struct LockedPointerSurface(Entity);
 
 impl<S: X11Selection> Dispatch<LockedPointerServer, Entity> for InnerServerState<S> {
     fn request(
@@ -916,24 +970,44 @@ impl<S: X11Selection> Dispatch<LockedPointerServer, Entity> for InnerServerState
                 surface_x,
                 surface_y,
             } => {
-                let (client, scale) = state
-                    .world
-                    .query_one_mut::<(&LockedPointerClient, &SurfaceScaleFactor)>(*entity)
-                    .unwrap();
+                let Some(surf_key) = ({
+                    let mut query = state.world.query_one::<&LockedPointerSurface>(*entity).ok();
+                    query.as_mut().and_then(|q| q.get()).map(|s| s.0)
+                }) else {
+                    warn!("set_cursor_position_hint ignored: missing LockedPointerSurface");
+                    return;
+                };
 
-                // Xwayland believes that the surface is actually <surface scale factor> times bigger
-                // than it currently is, and therefore that the cursor position is also scaled up by the same
-                // amount. So we need to divide the cursor position from Xwayland by the surface scale
-                // to get where the cursor should actually be positioned.
+                let cursor_hint = if state.compositor_scaling {
+                    super::event::xwayland_to_surface_input_coords(
+                        &state.world,
+                        surf_key,
+                        surface_x,
+                        surface_y,
+                    )
+                } else {
+                    state
+                        .world
+                        .get::<&SurfaceScaleFactor>(surf_key)
+                        .ok()
+                        .map(|s| {
+                            let scale = super::event::safe_scale(s.0);
+                            (surface_x / scale, surface_y / scale)
+                        })
+                        .unwrap_or((surface_x, surface_y))
+                };
 
-                client.set_cursor_position_hint(surface_x / scale.0, surface_y / scale.0);
+                if let Ok(client) = state.world.get::<&LockedPointerClient>(*entity) {
+                    client.set_cursor_position_hint(cursor_hint.0, cursor_hint.1);
+                } else {
+                    warn!("set_cursor_position_hint ignored: stale LockedPointerClient");
+                }
             }
             lp::Request::Destroy => {
-                {
-                    let client = state.world.get::<&LockedPointerClient>(*entity).unwrap();
+                if let Ok(client) = state.world.get::<&LockedPointerClient>(*entity) {
                     client.destroy();
                 }
-                state.world.despawn(*entity).unwrap();
+                let _ = state.world.despawn(*entity);
             }
             _ => warn!("unhandled locked pointer request: {request:?}"),
         }
@@ -963,23 +1037,31 @@ impl<S: X11Selection>
                 region,
                 lifetime,
             } => {
-                let surf_key: Entity = surface.data().copied().unwrap();
-                let ptr_key: Entity = pointer.data().copied().unwrap();
+                let Some(surf_key) = surface.data().copied() else {
+                    warn!("confine_pointer ignored: stale surface");
+                    return;
+                };
+                let Some(ptr_key) = pointer.data().copied() else {
+                    warn!("confine_pointer ignored: stale pointer");
+                    return;
+                };
 
                 let entity = state.world.reserve_entity();
                 let client = {
-                    let c_surface = state
-                        .world
-                        .get::<&client::wl_surface::WlSurface>(surf_key)
-                        .unwrap();
-                    let c_ptr = state
-                        .world
-                        .get::<&client::wl_pointer::WlPointer>(ptr_key)
-                        .unwrap();
+                    let Ok(c_surface) = state.world.get::<&client::wl_surface::WlSurface>(surf_key)
+                    else {
+                        warn!("confine_pointer ignored: missing surface");
+                        return;
+                    };
+                    let Ok(c_ptr) = state.world.get::<&client::wl_pointer::WlPointer>(ptr_key)
+                    else {
+                        warn!("confine_pointer ignored: missing pointer");
+                        return;
+                    };
                     client.confine_pointer(
                         &c_surface,
                         &c_ptr,
-                        region.as_ref().map(|r| r.data().unwrap()),
+                        region.as_ref().and_then(|r| r.data().copied()),
                         convert_wenum(lifetime),
                         &state.qh,
                         entity,
@@ -996,39 +1078,41 @@ impl<S: X11Selection>
                 region,
                 lifetime,
             } => {
-                let surf_key: Entity = surface.data().copied().unwrap();
-                let ptr_key: Entity = pointer.data().copied().unwrap();
+                let Some(surf_key) = surface.data().copied() else {
+                    warn!("lock_pointer ignored: stale surface");
+                    return;
+                };
+                let Some(ptr_key) = pointer.data().copied() else {
+                    warn!("lock_pointer ignored: stale pointer");
+                    return;
+                };
                 let entity = state.world.reserve_entity();
 
                 let client = {
-                    let c_surface = state
-                        .world
-                        .get::<&client::wl_surface::WlSurface>(surf_key)
-                        .unwrap();
-                    let c_ptr = state
-                        .world
-                        .get::<&client::wl_pointer::WlPointer>(ptr_key)
-                        .unwrap();
+                    let Ok(c_surface) = state.world.get::<&client::wl_surface::WlSurface>(surf_key)
+                    else {
+                        warn!("lock_pointer ignored: missing surface");
+                        return;
+                    };
+                    let Ok(c_ptr) = state.world.get::<&client::wl_pointer::WlPointer>(ptr_key)
+                    else {
+                        warn!("lock_pointer ignored: missing pointer");
+                        return;
+                    };
                     client.lock_pointer(
                         &c_surface,
                         &c_ptr,
-                        region.as_ref().map(|r| r.data().unwrap()),
+                        region.as_ref().and_then(|r| r.data().copied()),
                         convert_wenum(lifetime),
                         &state.qh,
                         entity,
                     )
                 };
                 let server = data_init.init(id, entity);
-                let surface_scale = state
-                    .world
-                    .get::<&SurfaceScaleFactor>(surf_key)
-                    .as_deref()
-                    .copied()
-                    .unwrap();
 
                 state
                     .world
-                    .spawn_at(entity, (client, server, surface_scale));
+                    .spawn_at(entity, (client, server, LockedPointerSurface(surf_key)));
             }
             Request::Destroy => {
                 client.destroy();
@@ -1136,10 +1220,14 @@ impl<S: X11Selection> Dispatch<s_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, En
         _: &DisplayHandle,
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
-        let client = state
+        let Some(client) = state
             .world
             .get::<&c_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2>(*entity)
-            .unwrap();
+            .ok()
+        else {
+            warn!("tablet tool request ignored: stale tool client");
+            return;
+        };
         match request {
             s_tablet::zwp_tablet_tool_v2::Request::SetCursor {
                 serial,
@@ -1147,19 +1235,28 @@ impl<S: X11Selection> Dispatch<s_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, En
                 hotspot_x,
                 hotspot_y,
             } => {
-                let surf_key: Option<Entity> = surface.map(|s| s.data().copied().unwrap());
-                let c_surface = surf_key.map(|key| {
-                    state
-                        .world
-                        .get::<&client::wl_surface::WlSurface>(key)
-                        .unwrap()
-                });
+                let c_surface = if let Some(s) = surface {
+                    let Some(e) = s.data().copied() else {
+                        warn!("tablet set_cursor ignored: stale cursor surface");
+                        return;
+                    };
+
+                    let Some(surface) = state.world.get::<&client::wl_surface::WlSurface>(e).ok()
+                    else {
+                        warn!("tablet set_cursor ignored: stale cursor surface");
+                        return;
+                    };
+
+                    Some(surface)
+                } else {
+                    None
+                };
                 client.set_cursor(serial, c_surface.as_deref(), hotspot_x, hotspot_y);
             }
             s_tablet::zwp_tablet_tool_v2::Request::Destroy => {
                 client.destroy();
                 drop(client);
-                state.world.despawn(*entity).unwrap();
+                let _ = state.world.despawn(*entity);
             }
             other => warn!("unhandled tablet tool request: {other:?}"),
         }
@@ -1478,6 +1575,7 @@ impl<S: X11Selection> GlobalDispatch<WlOutput, Global> for InnerServerState<S> {
                 server,
                 client,
                 event::OutputScaleFactor::Output(1),
+                event::TrueOutputScaleFactor(event::OutputScaleFactor::Output(1)),
                 event::OutputDimensions::default(),
                 GlobalName(data.name),
             ),
@@ -1573,6 +1671,11 @@ impl<S: X11Selection> Dispatch<XwaylandSurfaceV1, Entity> for InnerServerState<S
                     let mut builder = hecs::EntityBuilder::new();
                     builder.add_bundle(bundle);
                     state.world.insert(*entity, builder.build()).unwrap();
+                    if let Ok(mut scale) = state.world.get::<&mut SurfaceScaleFactor>(*entity) {
+                        if state.compositor_scaling {
+                            scale.0 = state.global_scale;
+                        }
+                    }
                     state.world.remove_one::<SurfaceSerial>(*entity).unwrap();
                     let data = state.world.entity(*entity).unwrap();
                     let win = data.get::<&x::Window>().as_deref().copied().unwrap();
