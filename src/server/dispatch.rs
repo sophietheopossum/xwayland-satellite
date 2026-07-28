@@ -278,17 +278,11 @@ impl<S: X11Selection> Dispatch<WlBuffer, Entity> for InnerServerState<S> {
     ) {
         assert!(matches!(request, Request::<WlBuffer>::Destroy));
 
-        let Some(buffer) = state
-            .world
-            .get::<&client::wl_buffer::WlBuffer>(*entity)
-            .ok()
-        else {
-            warn!("buffer destroy ignored: stale buffer");
-            return;
-        };
-
-        buffer.destroy();
-        drop(buffer);
+        if let Ok(buffer) = state.world.get::<&client::wl_buffer::WlBuffer>(*entity) {
+            buffer.destroy();
+        } else {
+            warn!("buffer destroy: stale buffer proxy");
+        }
         let _ = state.world.despawn(*entity);
     }
 }
@@ -461,6 +455,9 @@ impl<S: X11Selection> Dispatch<WlTouch, Entity> for InnerServerState<S> {
                 touch.release();
                 drop(touch);
                 let _ = state.world.remove_one::<event::TouchFocus>(*entity);
+                let _ = state
+                    .world
+                    .remove::<(client::wl_touch::WlTouch, WlTouch)>(*entity);
             }
             _ => warn!("unhandled touch request: {request:?}"),
         }
@@ -602,11 +599,9 @@ impl<S: X11Selection> Dispatch<WlOutput, Entity> for InnerServerState<S> {
 
                 output.release();
                 drop(output);
-                // remove both sides: server binding is gone, client proxy is dead
                 let _ = state
                     .world
                     .remove_one::<client::wl_output::WlOutput>(*entity);
-                let _ = state.world.remove_one::<WlOutput>(*entity);
             }
             _ => warn!("unhandled output request {request:?}"),
         }

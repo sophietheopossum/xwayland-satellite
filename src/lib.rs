@@ -39,6 +39,17 @@ pub trait RunData {
     fn flags(&self) -> &[String] {
         &[]
     }
+    /// Render at the highest active output scale and let the compositor downscale.
+    /// On by default in the binary; library users may want it off.
+    fn compositor_scaling(&self) -> bool {
+        false
+    }
+    /// Pins the X11 render scale instead of picking max(output_scale).
+    /// Saves VRAM on low-end hardware without breaking HiDPI window placement.
+    /// compositor_scaling() keeps working when this is set.
+    fn base_scale(&self) -> Option<f64> {
+        None
+    }
     fn server(&self) -> Option<UnixStream> {
         None
     }
@@ -153,7 +164,9 @@ pub fn main(mut data: impl RunData) -> Option<()> {
         }
     };
 
-    let mut server_state = EarlyServerState::new(dh, data.server(), connection);
+    let mut server_state =
+        EarlyServerState::new(dh, data.server(), connection, data.compositor_scaling());
+    server_state.set_base_scale(data.base_scale());
     server_state.run();
 
     // Remove the lifetimes on our fds to avoid borrowing issues, since we know they will exist for

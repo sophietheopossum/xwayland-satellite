@@ -158,8 +158,10 @@ impl WindowData {
         }
 
         let dims = &mut self.attrs.dims;
-        dims.x += (offset.x - self.output_offset.x) as i16;
-        dims.y += (offset.y - self.output_offset.y) as i16;
+        let new_x = (dims.x as i64) + (offset.x - self.output_offset.x) as i64;
+        let new_y = (dims.y as i64) + (offset.y - self.output_offset.y) as i64;
+        dims.x = new_x.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+        dims.y = new_y.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
         self.output_offset = offset;
 
         if connection.set_window_dims(
@@ -486,6 +488,8 @@ pub struct InnerServerState<S: X11Selection> {
     new_scale: Option<f64>,
     pub global_scale: f64,
     pub compositor_scaling: bool,
+    /// If set, pins the global X11 render scale instead of auto max(output_scale).
+    pub base_scale: Option<f64>,
 }
 
 impl<S: X11Selection> ServerState<NoConnection<S>> {
@@ -597,6 +601,7 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             new_scale: None,
             global_scale: 1.0,
             compositor_scaling,
+            base_scale: None,
             decoration_manager,
             world,
         };
@@ -620,6 +625,18 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
 }
 
 impl<C: XConnection> ServerState<C> {
+    pub fn set_base_scale(&mut self, base_scale: Option<f64>) {
+        if let Some(s) = base_scale {
+            if (1.0..=8.0).contains(&s) && s.is_finite() {
+                self.inner.base_scale = Some(s);
+            } else {
+                log::warn!("invalid base_scale {s}, ignoring");
+            }
+        } else {
+            self.inner.base_scale = None;
+        }
+    }
+
     pub fn run(&mut self) {
         if let Some(r) = self.queue.prepare_read() {
             let fd = r.connection_fd();
@@ -818,6 +835,8 @@ impl<C: XConnection> ServerState<C> {
                 }
 
                 let old_scale = self.global_scale;
+                // base_scale wins if the user pinned it
+                let scale = self.base_scale.unwrap_or(scale);
                 debug!("Using new scale {scale}");
                 self.new_scale = Some(scale);
                 self.global_scale = scale;
@@ -918,8 +937,8 @@ impl<C: XConnection> ServerState<C> {
                             server_output.geometry(
                                 scaled_x,
                                 scaled_y,
-                                (*physical_width as f64 * scale).round() as i32,
-                                (*physical_height as f64 * scale).round() as i32,
+                                *physical_width,
+                                *physical_height,
                                 convert_wenum(*subpixel),
                                 make.clone(),
                                 model.clone(),
@@ -954,11 +973,12 @@ impl<C: XConnection> ServerState<C> {
                     }
                 }
             } else if use_compositor_scaling {
-                // drop back to 1.0 once the last output disappears
-                if self.global_scale != 1.0 {
-                    debug!("No outputs available, resetting global_scale to 1.0");
-                    self.global_scale = 1.0;
-                    self.new_scale = Some(1.0);
+                // no outputs left, so fall back to base_scale (or 1.0)
+                let reset_scale = self.base_scale.unwrap_or(1.0);
+                if self.global_scale != reset_scale {
+                    debug!("No outputs available, resetting global_scale to {reset_scale}");
+                    self.global_scale = reset_scale;
+                    self.new_scale = Some(reset_scale);
 
                     let mut surface_query = self.world.query::<&mut SurfaceScaleFactor>().with::<(
                         &WlSurface,
@@ -968,7 +988,7 @@ impl<C: XConnection> ServerState<C> {
                     );
                     let mut surfaces = vec![];
                     for (surface, surface_scale) in surface_query.iter() {
-                        surface_scale.0 = 1.0;
+                        surface_scale.0 = reset_scale;
                         surfaces.push(surface);
                     }
                     drop(surface_query);
@@ -1016,13 +1036,11 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         for (entity, name) in query.iter() {
             if *name == global {
                 self.updated_outputs.push(*entity);
-                self.world
-                    .remove::<(
-                        OutputScaleFactor,
-                        event::TrueOutputScaleFactor,
-                        OutputDimensions,
-                    )>(*entity)
-                    .unwrap();
+                let _ = self.world.remove::<(
+                    OutputScaleFactor,
+                    event::TrueOutputScaleFactor,
+                    OutputDimensions,
+                )>(*entity);
                 let _ = self.world.remove_one::<event::X11OutputPosition>(*entity);
 
                 let mut surfaces_to_update = Vec::new();
@@ -1035,7 +1053,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                     }
                     if let Some(on_out) = on_out {
                         if on_out.0 == *entity {
-                            // try another active output before clearing OnOutput
+                            // prefer any live output so the window doesn't lose its placement
                             let mut fallback = None;
                             if let Some(ref entered) = entered {
                                 if let Some(&next_out) = entered.0.first() {
@@ -1046,7 +1064,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                                 *on_out = OnOutput(next_out);
                                 surfaces_to_update.push((e, next_out));
                             } else {
-                                // clear OnOutput below if there is no fallback
+                                // no fallback output left, so drop the association instead of pointing at a dead one
                                 surfaces_to_update.push((e, hecs::Entity::DANGLING));
                             }
                         }
@@ -1073,32 +1091,18 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                                 if let Some(win_data) = win_query.get() {
                                     let ox_diff = ox - win_data.output_offset.x;
                                     let oy_diff = oy - win_data.output_offset.y;
-                                    win_data.attrs.dims.x += ox_diff as i16;
-                                    win_data.attrs.dims.y += oy_diff as i16;
+                                    let new_x = (win_data.attrs.dims.x as i64) + ox_diff as i64;
+                                    let new_y = (win_data.attrs.dims.y as i64) + oy_diff as i64;
+                                    win_data.attrs.dims.x =
+                                        new_x.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+                                    win_data.attrs.dims.y =
+                                        new_y.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
                                     win_data.output_offset = WindowOutputOffset { x: ox, y: oy };
                                 }
                             }
                         }
 
                         self.updated_outputs.push(next_out);
-                        if let Ok(scale) = self.world.get::<&SurfaceScaleFactor>(e) {
-                            let scale_val = scale.0;
-                            let comp_scaling = self.compositor_scaling;
-                            let glob_scale = self.global_scale;
-                            if let Ok(out_query) = self.world.query_one::<(
-                                &mut OutputScaleFactor,
-                                &mut event::TrueOutputScaleFactor,
-                            )>(
-                                next_out
-                            ) {
-                                let _ = event::update_output_scale(
-                                    out_query,
-                                    OutputScaleFactor::Fractional(scale_val),
-                                    comp_scaling,
-                                    glob_scale,
-                                );
-                            }
-                        }
                     }
                 }
                 if self.global_output_offset.x.owner == Some(*entity) {
