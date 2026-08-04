@@ -13,6 +13,7 @@ struct RealData {
     display: Option<String>,
     listenfds: Vec<OwnedFd>,
     flags: Vec<String>,
+    base_scale: Option<f64>,
 }
 impl xwayland_satellite::RunData for RealData {
     fn display(&self) -> Option<&str> {
@@ -25,6 +26,14 @@ impl xwayland_satellite::RunData for RealData {
 
     fn flags(&self) -> &[String] {
         &self.flags
+    }
+
+    fn compositor_scaling(&self) -> bool {
+        true
+    }
+
+    fn base_scale(&self) -> Option<f64> {
+        self.base_scale
     }
 }
 
@@ -242,6 +251,20 @@ fn parse_args() -> RealData {
             }
         }
     }
+    if let Ok(v) = std::env::var("XWAYLAND_SATELLITE_BASE_SCALE") {
+        match v.trim().parse::<f64>() {
+            Ok(s) if (1.0..=8.0).contains(&s) && s.is_finite() => {
+                data.base_scale = Some(s);
+            }
+            _ => {
+                log::warn!(
+                    "invalid value {v:?} for XWAYLAND_SATELLITE_BASE_SCALE, \
+                     ignoring (must be between 1.0 and 8.0)"
+                );
+            }
+        }
+    }
+
     data.flags = flags.to_vec();
 
     data

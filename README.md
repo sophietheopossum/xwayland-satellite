@@ -45,11 +45,17 @@ which is likely after your compositor is started if it supports systemd.
 Note that you *do not* need the systemd service if the compositor already integrates xwayland-satellite (see below).
 
 ## Scaling/HiDPI
-For most GTK and Qt apps, xwayland-satellite should automatically scale them properly. Note that for mixed DPI monitor setups, satellite will choose
-the smallest monitor's DPI, meaning apps may have small text on other monitors.
+For most GTK and Qt apps, xwayland-satellite should automatically pick up the right scale.
 
-Other miscellaneous apps (such as Wine apps) may have small text on HiDPI displays. It is application dependent on getting apps to scale properly with satellite,
-so you will have to figure out what app specific config needs to be set. See [the Arch Wiki on HiDPI](https://wiki.archlinux.org/title/HiDPI) for a good place start.
+By default, satellite renders X11 apps at the highest active output scale so text stays sharp on HiDPI screens (compositor handles downscaling for lower-DPI outputs).
+
+### `XWAYLAND_SATELLITE_BASE_SCALE`
+
+Pins the render scale to a fixed multiplier (1.0–8.0) instead of picking `max(output_scale)`. Compositor-side scaling stays on, so popup positioning and coordinate mapping still line up.
+
+Set it to `1` to render at native resolution but keep correct window geometry on HiDPI displays — handy when supersampling costs too much on weak hardware.
+
+Other apps, such as Wine apps, may still need their own HiDPI settings. See [the Arch Wiki on HiDPI](https://wiki.archlinux.org/title/HiDPI) for a good starting point.
 
 Satellite acts as an Xsettings manager for setting scaling related settings, but will get out of the way of other Xsettings managers.
 To manually set these settings, try [xsettingsd](https://codeberg.org/derat/xsettingsd) or another Xsettings manager.
