@@ -51,6 +51,9 @@ use wayland_server::protocol::{
 #[derive(Copy, Clone)]
 pub(super) struct SurfaceScaleFactor(pub f64);
 
+/// Every output a surface is currently on, in enter order (most recent last).
+/// [`OnOutput`] is the surface's positioning anchor; this set decides where to
+/// re-anchor when the anchor output itself leaves.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct EnteredOutputs(pub Vec<Entity>);
 
@@ -220,17 +223,15 @@ impl SurfaceEvents {
 
                 debug!("{} entered {}", surface.id(), output.id());
 
-                // Track every output the surface is on. The anchor
-                // (OnOutput) only changes when its output actually leaves:
-                // re-anchoring on every enter turns transient overlaps
-                // (bounding-box sweeps during animations, brief flickers on
-                // layout changes) into X11 repositioning feedback loops.
-                match data.get::<&mut EnteredOutputs>() {
-                    Some(mut entered) => {
-                        entered.0.retain(|e| *e != output_entity);
-                        entered.0.push(output_entity);
-                    }
-                    None => cmd.insert_one(target, EnteredOutputs(vec![output_entity])),
+                // Track every output the surface is on (the SurfaceBundle
+                // guarantees the component exists). The anchor (OnOutput)
+                // only changes when its output actually leaves: re-anchoring
+                // on every enter turns transient overlaps (bounding-box
+                // sweeps during animations, brief flickers on layout
+                // changes) into X11 repositioning feedback loops.
+                if let Ok(mut entered) = state.world.get::<&mut EnteredOutputs>(target) {
+                    entered.0.retain(|e| *e != output_entity);
+                    entered.0.push(output_entity);
                 }
 
                 let anchor_is_valid = data.get::<&OnOutput>().is_some_and(|o| {
@@ -331,7 +332,19 @@ impl SurfaceEvents {
                                     connection,
                                 );
                             }
+                            drop(query);
                             cmd.insert_one(target, OnOutput(next_output));
+                            // Keep scale bookkeeping in sync with the new
+                            // anchor; the compositor-scaling path recomputes
+                            // from updated_outputs.
+                            state.updated_outputs.push(next_output);
+                            let scale = data.get::<&SurfaceScaleFactor>().unwrap();
+                            let _ = update_output_scale(
+                                state.world.query_one(next_output).unwrap(),
+                                OutputScaleFactor::Fractional(scale.0),
+                                state.compositor_scaling,
+                                state.global_scale,
+                            );
                         }
                         None => {
                             cmd.remove_one::<OnOutput>(target);
@@ -1324,11 +1337,6 @@ impl Event for client::wl_touch::Event {
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) struct OnOutput(pub Entity);
 
-/// Every output a surface is currently on, in enter order (most recent last).
-/// [`OnOutput`] is the surface's positioning anchor; this set decides where to
-/// re-anchor when the anchor output itself leaves.
-pub(super) struct EnteredOutputs(Vec<Entity>);
-
 struct OutputName(String);
 fn get_output_name(output: Option<&OnOutput>, world: &World) -> Option<String> {
     output.map(|o| world.get::<&OutputName>(o.0).unwrap().0.clone())
@@ -1751,12 +1759,19 @@ fn anchor_window_to_output<C: XConnection>(
     let Ok(dimensions) = world.get::<&OutputDimensions>(output_entity) else {
         return false;
     };
+    // Prefer the compositor-scaling X11 position when present; fall back to
+    // the raw dimensions-derived offset otherwise.
+    let (ox, oy) = if let Ok(pos) = world.get::<&X11OutputPosition>(output_entity) {
+        (pos.x, pos.y)
+    } else {
+        (
+            dimensions.x - global_output_offset.x.value,
+            dimensions.y - global_output_offset.y.value,
+        )
+    };
     win_data.update_output_offset(
         window,
-        WindowOutputOffset {
-            x: dimensions.x - global_output_offset.x.value,
-            y: dimensions.y - global_output_offset.y.value,
-        },
+        WindowOutputOffset { x: ox, y: oy },
         connection,
     );
     if last_focused_toplevel == Some(window) {
@@ -1865,7 +1880,7 @@ pub(super) fn update_window_output_offsets(
         let mut popup_query =
             world.query::<(&x::Window, &mut WindowData, &mut SurfaceScaleFactor)>();
         for (_, (window, data, scale)) in popup_query.into_iter().filter(|(_, (_, data, _))| {
-            data.attrs.is_popup
+            data.attrs.role.is_popup()
                 && data
                     .attrs
                     .transient_for
