@@ -217,39 +217,43 @@ impl SurfaceEvents {
                 };
 
                 surface.enter(&output);
-                let on_output = OnOutput(output_entity);
 
                 debug!("{} entered {}", surface.id(), output.id());
 
-                if let Ok(mut entered) = state.world.get::<&mut EnteredOutputs>(target) {
-                    if !entered.0.contains(&output_entity) {
+                // Track every output the surface is on. The anchor
+                // (OnOutput) only changes when its output actually leaves:
+                // re-anchoring on every enter turns transient overlaps
+                // (bounding-box sweeps during animations, brief flickers on
+                // layout changes) into X11 repositioning feedback loops.
+                match data.get::<&mut EnteredOutputs>() {
+                    Some(mut entered) => {
+                        entered.0.retain(|e| *e != output_entity);
                         entered.0.push(output_entity);
                     }
+                    None => cmd.insert_one(target, EnteredOutputs(vec![output_entity])),
                 }
+
+                let anchor_is_valid = data.get::<&OnOutput>().is_some_and(|o| {
+                    state
+                        .world
+                        .entity(o.0)
+                        .is_ok_and(|e| e.has::<OutputDimensions>())
+                });
 
                 let mut query = data.query::<(&x::Window, &mut WindowData)>();
                 if let Some((window, win_data)) = query.get() {
-                    let Some(dimensions) = output_data.get::<&OutputDimensions>() else {
-                        return;
-                    };
-                    let (ox, oy) =
-                        if let Ok(pos) = state.world.get::<&X11OutputPosition>(output_entity) {
-                            (pos.x, pos.y)
-                        } else {
-                            (
-                                dimensions.x - state.global_output_offset.x.value,
-                                dimensions.y - state.global_output_offset.y.value,
-                            )
-                        };
-                    win_data.update_output_offset(
-                        *window,
-                        WindowOutputOffset { x: ox, y: oy },
-                        connection,
-                    );
-                    if state.last_focused_toplevel == Some(*window) {
-                        let output = get_output_name(Some(&on_output), &state.world);
-                        debug!("focused window changed outputs - resetting primary output");
-                        connection.focus_window(*window, output);
+                    if !anchor_is_valid
+                        && anchor_window_to_output(
+                            &state.world,
+                            *window,
+                            win_data,
+                            output_entity,
+                            &state.global_output_offset,
+                            state.last_focused_toplevel,
+                            connection,
+                        )
+                    {
+                        cmd.insert_one(target, OnOutput(output_entity));
                     }
 
                     if state.fractional_scale.is_none() {
@@ -271,16 +275,22 @@ impl SurfaceEvents {
                     } else {
                         let scale = data.get::<&SurfaceScaleFactor>().unwrap();
                         if update_output_scale(
-                            state.world.query_one(on_output.0).unwrap(),
+                            state.world.query_one(output_entity).unwrap(),
                             OutputScaleFactor::Fractional(scale.0),
                             state.compositor_scaling,
                             state.global_scale,
                         ) {
-                            state.updated_outputs.push(on_output.0);
+                            state.updated_outputs.push(output_entity);
                         }
                     }
+                } else {
+                    // No X11 window on this surface: either it has not been
+                    // associated with one yet (that happens later, when the
+                    // Xwayland serial handshake pairs them), or its window has
+                    // since been destroyed. Nothing has an X11 position to keep
+                    // stable, so just track the most recent output.
+                    cmd.insert_one(target, OnOutput(output_entity));
                 }
-                cmd.insert_one(target, on_output);
             }
             Event::Leave { output } => {
                 let output_entity = output.data().copied().unwrap();
@@ -288,32 +298,44 @@ impl SurfaceEvents {
                     return;
                 };
                 surface.leave(&output);
-                if let Ok(mut entered) = state.world.get::<&mut EnteredOutputs>(target) {
-                    entered.0.retain(|&e| e != output_entity);
+
+                if let Some(mut entered) = data.get::<&mut EnteredOutputs>() {
+                    entered.0.retain(|e| *e != output_entity);
                 }
-                if data
+
+                let anchored_here = data
                     .get::<&OnOutput>()
-                    .is_some_and(|o| o.0 == output_entity)
-                {
-                    cmd.remove_one::<OnOutput>(target);
-                    let mut fallback = None;
-                    if let Ok(entered) = state.world.get::<&EnteredOutputs>(target) {
-                        if let Some(&next_output) = entered.0.iter().find(|&&e| e != output_entity)
-                        {
-                            fallback = Some(next_output);
+                    .is_some_and(|o| o.0 == output_entity);
+                if anchored_here {
+                    // The anchor output is gone for real: re-anchor to the
+                    // most recently entered output the surface is still on.
+                    let next = data.get::<&EnteredOutputs>().and_then(|entered| {
+                        entered.0.iter().rev().copied().find(|e| {
+                            state
+                                .world
+                                .entity(*e)
+                                .is_ok_and(|en| en.has::<OutputDimensions>())
+                        })
+                    });
+                    match next {
+                        Some(next_output) => {
+                            let mut query = data.query::<(&x::Window, &mut WindowData)>();
+                            if let Some((window, win_data)) = query.get() {
+                                anchor_window_to_output(
+                                    &state.world,
+                                    *window,
+                                    win_data,
+                                    next_output,
+                                    &state.global_output_offset,
+                                    state.last_focused_toplevel,
+                                    connection,
+                                );
+                            }
+                            cmd.insert_one(target, OnOutput(next_output));
                         }
-                    }
-                    if let Some(next_output) = fallback {
-                        cmd.insert_one(target, OnOutput(next_output));
-                        state.updated_outputs.push(next_output);
-                        let scale = data.get::<&SurfaceScaleFactor>().unwrap();
-                        // output is already queued, just keep the true scale from drifting
-                        let _ = update_output_scale(
-                            state.world.query_one(next_output).unwrap(),
-                            OutputScaleFactor::Fractional(scale.0),
-                            state.compositor_scaling,
-                            state.global_scale,
-                        );
+                        None => {
+                            cmd.remove_one::<OnOutput>(target);
+                        }
                     }
                 }
             }
@@ -1301,6 +1323,12 @@ impl Event for client::wl_touch::Event {
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) struct OnOutput(pub Entity);
+
+/// Every output a surface is currently on, in enter order (most recent last).
+/// [`OnOutput`] is the surface's positioning anchor; this set decides where to
+/// re-anchor when the anchor output itself leaves.
+pub(super) struct EnteredOutputs(Vec<Entity>);
+
 struct OutputName(String);
 fn get_output_name(output: Option<&OnOutput>, world: &World) -> Option<String> {
     output.map(|o| world.get::<&OutputName>(o.0).unwrap().0.clone())
@@ -1706,6 +1734,37 @@ impl Default for OutputDimensions {
             logical_height: None,
         }
     }
+}
+
+/// Point a window's X11 position at `output_entity`, resetting the X11
+/// primary output if the window is focused. Returns false if the output's
+/// dimensions aren't known yet (no anchoring possible).
+fn anchor_window_to_output<C: XConnection>(
+    world: &World,
+    window: x::Window,
+    win_data: &mut WindowData,
+    output_entity: Entity,
+    global_output_offset: &GlobalOutputOffset,
+    last_focused_toplevel: Option<x::Window>,
+    connection: &mut C,
+) -> bool {
+    let Ok(dimensions) = world.get::<&OutputDimensions>(output_entity) else {
+        return false;
+    };
+    win_data.update_output_offset(
+        window,
+        WindowOutputOffset {
+            x: dimensions.x - global_output_offset.x.value,
+            y: dimensions.y - global_output_offset.y.value,
+        },
+        connection,
+    );
+    if last_focused_toplevel == Some(window) {
+        debug!("focused window changed outputs - resetting primary output");
+        let name = get_output_name(Some(&OnOutput(output_entity)), world);
+        connection.focus_window(window, name);
+    }
+    true
 }
 
 fn update_output_offset(
