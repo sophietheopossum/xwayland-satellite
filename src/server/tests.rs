@@ -19,6 +19,7 @@ use wayland_client::{
         wl_keyboard::WlKeyboard,
         wl_output::{self, WlOutput},
         wl_pointer::WlPointer,
+        wl_region::WlRegion,
         wl_registry::WlRegistry,
         wl_seat::{self, WlSeat},
         wl_shm::{Format, WlShm},
@@ -149,12 +150,20 @@ impl Compositor {
 
         (buffer, surface)
     }
+
+    fn create_region(&self) -> TestObject<WlRegion> {
+        TestObject::<WlRegion>::from_request(
+            &self.compositor.obj,
+            Req::<WlCompositor>::CreateRegion {},
+        )
+    }
 }
 
 #[derive(Debug, Default)]
 struct WindowData {
     mapped: bool,
     fullscreen: bool,
+    maximized: bool,
     dims: WindowDims,
 }
 #[derive(Default)]
@@ -215,6 +224,11 @@ impl super::XConnection for FakeXConnection {
     }
 
     #[track_caller]
+    fn set_maximized(&mut self, window: xcb::x::Window, maximized: bool) {
+        self.window_mut(window).maximized = maximized;
+    }
+
+    #[track_caller]
     fn set_window_dims(&mut self, window: Window, state: super::PendingSurfaceState) -> bool {
         self.window_mut(window).dims = WindowDims {
             x: state.x as _,
@@ -242,6 +256,15 @@ impl super::XConnection for FakeXConnection {
             "Unknown window: {window:?}"
         );
         self.send_take_focus_window = window.into();
+    }
+
+    #[track_caller]
+    fn focus_popup(&mut self, window: Window) {
+        assert!(
+            self.windows.contains_key(&window),
+            "Unknown window: {window:?}"
+        );
+        self.focused_window = window.into();
     }
 
     fn raise_to_top(&mut self, window: Window) {
@@ -717,6 +740,7 @@ impl TestFixture<FakeXConnection> {
                 height: 50,
             },
             fullscreen: false,
+            maximized: false,
         };
 
         self.new_window(window, false, data);
@@ -792,6 +816,7 @@ impl TestFixture<FakeXConnection> {
             mapped: true,
             dims,
             fullscreen: false,
+            maximized: false,
         };
         self.new_window(window, true, data);
         self.map_window(comp, window, &surface.obj, &buffer);
@@ -829,8 +854,8 @@ impl TestFixture<FakeXConnection> {
                 assert_eq!(
                     pos.size.as_ref().unwrap(),
                     &testwl::Vec2 {
-                        x: (dims.width as f64 / scale).ceil() as i32,
-                        y: (dims.height as f64 / scale).ceil() as i32
+                        x: (dims.width as f64 / scale).round() as i32,
+                        y: (dims.height as f64 / scale).round() as i32
                     }
                 );
 
@@ -839,8 +864,8 @@ impl TestFixture<FakeXConnection> {
                     pos.anchor_rect.as_ref().unwrap(),
                     &testwl::Rect {
                         size: testwl::Vec2 {
-                            x: (parent_win.dims.width as f64 / scale).ceil() as i32,
-                            y: (parent_win.dims.height as f64 / scale).ceil() as i32
+                            x: 1.max((parent_win.dims.width as f64 / scale).round() as i32),
+                            y: 1.max((parent_win.dims.height as f64 / scale).round() as i32)
                         },
                         offset: testwl::Vec2::default()
                     }
@@ -890,6 +915,7 @@ impl TestFixture<FakeXConnection> {
                 height: 50,
             },
             fullscreen: false,
+            maximized: false,
         };
         self.new_window(win_popup, override_redirect, data);
         if !override_redirect {
@@ -961,6 +987,7 @@ impl TestFixture<FakeXConnection> {
     }
 
     fn reconfigure_window(&mut self, window: Window, dims: WindowDims, override_redirect: bool) {
+        self.satellite.connection.window_mut(window).dims = dims;
         self.satellite
             .reconfigure_window(x::ConfigureNotifyEvent::new(
                 window,
@@ -1391,6 +1418,7 @@ fn window_group_properties() {
             ..Default::default()
         },
         fullscreen: false,
+        maximized: false,
     };
 
     let (_, surface) = comp.create_surface();
@@ -1430,6 +1458,7 @@ fn splash_window_fixed_size() {
         mapped: false,
         dims,
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(splash, false, data);
     f.satellite
@@ -2169,6 +2198,7 @@ fn reconfigure_popup_after_map() {
         mapped: true,
         dims: old_dims,
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(popup, true, popup_data);
     f.satellite.map_window(popup);
@@ -2397,6 +2427,7 @@ fn fullscreen_heuristic() {
                 height: 1000,
             },
             fullscreen: false,
+            maximized: false,
         };
         f.new_window(window, override_redirect, data);
         f.map_window(&comp, window, &surface.obj, &buffer);
@@ -2612,7 +2643,7 @@ fn fractional_scale_small_popup() {
         .get_surface_data(popup_id)
         .expect("Missing popup data");
     let pos = &data.popup().positioner_state;
-    assert_eq!(pos.size.unwrap(), testwl::Vec2 { x: 2, y: 1 });
+    assert_eq!(pos.size.unwrap(), testwl::Vec2 { x: 1, y: 1 });
 }
 
 #[test]
@@ -2635,6 +2666,7 @@ fn toplevel_size_limits_scaled() {
             ..Default::default()
         },
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(window, false, data);
     f.satellite.set_size_hints(
@@ -2801,6 +2833,7 @@ fn transient_for_toplevel() {
                 ..Default::default()
             },
             fullscreen: false,
+            maximized: false,
         },
     );
 
@@ -2977,6 +3010,7 @@ fn quick_destroy_window_with_serial() {
             height: 50,
         },
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(window, false, data);
     f.satellite.map_window(window);
@@ -3239,8 +3273,8 @@ fn client_side_decorations_fractional_scale() {
         f.run();
         f.run();
 
-        let x_width = (100.0 * scale).floor() as u16;
-        let x_height = (content_height * scale) as u16;
+        let x_width = (100.0 * scale).round() as u16;
+        let x_height = (content_height * scale).round() as u16;
         let dims = f.connection().window(window).dims;
         assert_eq!(
             (dims.width, dims.height),
@@ -3275,6 +3309,7 @@ fn client_side_decorations_no_global() {
             height: 50,
         },
         fullscreen: false,
+        maximized: false,
     };
 
     f.new_window(window, false, data);
@@ -3637,6 +3672,7 @@ fn test_window_offset_with_compositor_scaling() {
         WindowData {
             mapped: true,
             fullscreen: false,
+            maximized: false,
             dims: WindowDims {
                 x: 100,
                 y: 100,
@@ -3776,6 +3812,7 @@ fn test_monitor_disconnect_scaling_fallback() {
                             WindowData {
                                 mapped: true,
                                 fullscreen: false,
+                                maximized: false,
                                 dims: WindowDims {
                                     x: 1500,
                                     y: 100,
@@ -4004,4 +4041,308 @@ fn test_base_scale_override() {
     unsafe {
         std::env::remove_var("XWAYLAND_SATELLITE_BASE_SCALE");
     }
+}
+
+#[test]
+fn maximized() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+
+    f.satellite.set_maximized(win, SetState::Add);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        data.toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+
+    f.satellite.set_maximized(win, SetState::Remove);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        !data
+            .toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+
+    f.satellite.set_maximized(win, SetState::Toggle);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        data.toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+
+    f.satellite.set_maximized(win, SetState::Toggle);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        !data
+            .toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+
+    f.testwl
+        .configure_toplevel(id, 800, 600, vec![xdg_toplevel::State::Maximized]);
+    f.run();
+    f.run();
+    assert!(f.satellite.connection.windows[&win].maximized);
+
+    f.testwl.configure_toplevel(id, 800, 600, vec![]);
+    f.run();
+    f.run();
+    assert!(!f.satellite.connection.windows[&win].maximized);
+}
+
+#[test]
+fn maximized_pre_mapping() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(2);
+
+    let data = WindowData {
+        mapped: true,
+        dims: WindowDims {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        },
+        fullscreen: false,
+        maximized: false,
+    };
+    f.new_window(win, false, data);
+
+    // Set maximized before mapping
+    f.satellite.set_maximized(win, SetState::Add);
+
+    let (buffer, surface) = comp.create_surface();
+    f.map_window(&comp, win, &surface.obj, &buffer);
+    f.run();
+    f.run();
+
+    let id = f.check_new_surface();
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        data.toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+}
+
+#[test]
+fn input_region_scaling() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (surface, id) = f.create_toplevel(&comp, win);
+
+    let surface_entity = f.satellite.windows[&win];
+    f.satellite
+        .world
+        .get::<&mut super::event::SurfaceScaleFactor>(surface_entity)
+        .unwrap()
+        .0 = 2.0;
+
+    let region = comp.create_region();
+    region
+        .send_request(Req::<WlRegion>::Add {
+            x: 20,
+            y: 40,
+            width: 200,
+            height: 100,
+        })
+        .unwrap();
+
+    surface
+        .send_request(Req::<WlSurface>::SetInputRegion {
+            region: Some(region.obj.clone()),
+        })
+        .unwrap();
+    surface.send_request(Req::<WlSurface>::Commit {}).unwrap();
+
+    f.run();
+    f.run();
+
+    let surface_data = f.testwl.get_surface_data(id).unwrap();
+    // Scale 2.0 downsamples [20, 40, 200, 100] to [10, 20, 100, 50]
+    assert_eq!(
+        surface_data.input_region,
+        Some(vec![(10, 20, 100, 50)])
+    );
+
+    surface
+        .send_request(Req::<WlSurface>::SetInputRegion { region: None })
+        .unwrap();
+    surface.send_request(Req::<WlSurface>::Commit {}).unwrap();
+
+    f.run();
+    f.run();
+
+    let surface_data = f.testwl.get_surface_data(id).unwrap();
+    assert_eq!(surface_data.input_region, None);
+}
+
+#[test]
+fn input_region_complex_polygon_and_negative_coords() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (surface, id) = f.create_toplevel(&comp, win);
+
+    let surface_entity = f.satellite.windows[&win];
+    f.satellite
+        .world
+        .get::<&mut super::event::SurfaceScaleFactor>(surface_entity)
+        .unwrap()
+        .0 = 1.5;
+
+    let region = comp.create_region();
+    region
+        .send_request(Req::<WlRegion>::Add {
+            x: -60,
+            y: -30,
+            width: 60,
+            height: 30,
+        })
+        .unwrap();
+    region
+        .send_request(Req::<WlRegion>::Add {
+            x: 0,
+            y: -30,
+            width: 60,
+            height: 30,
+        })
+        .unwrap();
+    region
+        .send_request(Req::<WlRegion>::Add {
+            x: 60,
+            y: -30,
+            width: 60,
+            height: 30,
+        })
+        .unwrap();
+    region
+        .send_request(Req::<WlRegion>::Subtract {
+            x: 10,
+            y: -20,
+            width: 20,
+            height: 10,
+        })
+        .unwrap();
+
+    surface
+        .send_request(Req::<WlSurface>::SetInputRegion {
+            region: Some(region.obj.clone()),
+        })
+        .unwrap();
+    surface.send_request(Req::<WlSurface>::Commit {}).unwrap();
+
+    f.run();
+    f.run();
+
+    let surface_data = f.testwl.get_surface_data(id).unwrap();
+    let rects = surface_data.input_region.as_ref().unwrap();
+    assert_eq!(rects.len(), 3);
+
+    assert_eq!(rects[0].0 + rects[0].2, rects[1].0);
+    assert_eq!(rects[1].0 + rects[1].2, rects[2].0);
+
+    assert_eq!(rects[0], (-40, -20, 40, 20));
+    assert_eq!(rects[1], (0, -20, 40, 20));
+    assert_eq!(rects[2], (40, -20, 40, 20));
+}
+
+#[test]
+fn maximized_rapid_toggles_and_idempotence() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+
+    for _ in 0..5 {
+        f.satellite.set_maximized(win, SetState::Add);
+    }
+    f.run();
+    f.run();
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert_eq!(
+        data.toplevel()
+            .states
+            .iter()
+            .filter(|&&s| s == xdg_toplevel::State::Maximized)
+            .count(),
+        1
+    );
+
+    for i in 0..4 {
+        f.satellite.set_maximized(win, SetState::Toggle);
+        f.run();
+        f.run();
+        let data = f.testwl.get_surface_data(id).unwrap();
+        let is_max = data
+            .toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized);
+        assert_eq!(is_max, i % 2 == 1);
+    }
+
+    for _ in 0..5 {
+        f.satellite.set_maximized(win, SetState::Remove);
+    }
+    f.run();
+    f.run();
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        !data
+            .toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+}
+
+#[test]
+fn surface_destroy_with_active_input_region() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (surface, id) = f.create_toplevel(&comp, win);
+
+    for i in 1..=5 {
+        let region = comp.create_region();
+        region
+            .send_request(Req::<WlRegion>::Add {
+                x: i * 10,
+                y: i * 10,
+                width: 100,
+                height: 100,
+            })
+            .unwrap();
+        surface
+            .send_request(Req::<WlSurface>::SetInputRegion {
+                region: Some(region.obj),
+            })
+            .unwrap();
+        surface.send_request(Req::<WlSurface>::Commit {}).unwrap();
+        f.run();
+    }
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert_eq!(data.input_region, Some(vec![(50, 50, 100, 100)]));
+
+    f.satellite.unmap_window(win);
+    f.satellite.destroy_window(win);
+    surface.obj.destroy();
+    f.run();
+    f.run();
+
+    assert!(f.testwl.get_surface_data(id).is_none());
 }
