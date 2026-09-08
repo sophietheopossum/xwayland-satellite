@@ -234,6 +234,7 @@ impl XState {
         };
         r.create_ewmh_window();
         r.set_xsettings_owner();
+        r.update_global_scale(1.0);
         r
     }
 
