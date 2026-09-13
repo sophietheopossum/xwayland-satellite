@@ -328,17 +328,15 @@ impl SurfaceEvents {
 
                 debug!("{} entered {}", surface.id(), output.id());
 
-                // Track every output the surface is on. The anchor
-                // (OnOutput) only changes when its output actually leaves:
-                // re-anchoring on every enter turns transient overlaps
-                // (bounding-box sweeps during animations, brief flickers on
-                // layout changes) into X11 repositioning feedback loops.
-                match data.get::<&mut EnteredOutputs>() {
-                    Some(mut entered) => {
-                        entered.0.retain(|e| *e != output_entity);
-                        entered.0.push(output_entity);
-                    }
-                    None => cmd.insert_one(target, EnteredOutputs(vec![output_entity])),
+                // Track every output the surface is on (the SurfaceBundle
+                // guarantees the component exists). The anchor (OnOutput)
+                // only changes when its output actually leaves: re-anchoring
+                // on every enter turns transient overlaps (bounding-box
+                // sweeps during animations, brief flickers on layout
+                // changes) into X11 repositioning feedback loops.
+                if let Ok(mut entered) = state.world.get::<&mut EnteredOutputs>(target) {
+                    entered.0.retain(|e| *e != output_entity);
+                    entered.0.push(output_entity);
                 }
 
                 let anchor_is_valid = data.get::<&OnOutput>().is_some_and(|o| {
