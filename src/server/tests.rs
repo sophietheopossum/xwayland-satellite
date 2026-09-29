@@ -2272,6 +2272,49 @@ fn output_offset_surface_positioning() {
     f.assert_window_dimensions(popup, p_id, popup_dims);
 }
 
+/// Rootless Xwayland maps a window again with a new wl_surface. The old
+/// surface's output anchor must not carry over to it: the window is anchored
+/// to, and positioned on, the output the new surface enters.
+#[test]
+fn remapped_window_anchors_to_the_output_it_enters() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+
+    let (_, output_a) = f.new_output(0, 0);
+    let (_, output_b) = f.new_output(500, 100);
+    f.run();
+
+    let window = Window::new(1);
+    let (surface, old_id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(old_id, &output_b);
+    f.run();
+    let mut dims = WindowDims {
+        x: 500,
+        y: 100,
+        width: 100,
+        height: 100,
+    };
+    f.assert_window_dimensions(window, old_id, dims);
+
+    f.satellite.unmap_window(window);
+    surface.obj.destroy();
+    f.run();
+
+    let (buffer, surface) = comp.create_surface();
+    f.map_window(&comp, window, &surface.obj, &buffer);
+    f.run();
+    let id = f.check_new_surface();
+    assert_ne!(id, old_id);
+    f.testwl
+        .configure_toplevel(id, 100, 100, vec![xdg_toplevel::State::Activated]);
+    f.run();
+    f.testwl.move_surface_to_output(id, &output_a);
+    f.run();
+
+    dims.x = 0;
+    dims.y = 0;
+    f.assert_window_dimensions(window, id, dims);
+}
+
 #[test]
 fn output_offset_xdg_override() {
     let (mut f, comp) = TestFixture::new_with_compositor();
