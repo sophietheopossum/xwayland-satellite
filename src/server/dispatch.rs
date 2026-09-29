@@ -323,7 +323,19 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                 // the sticky-anchor check in Enter for an output the new
                 // surface never entered, and the window would never
                 // re-anchor to the output it is really on.
-                cmd.remove_one::<event::OnOutput>(*entity);
+                //
+                // Popups keep theirs. Their X position is the one the client
+                // chose relative to the parent, and create_popup hands them
+                // the parent's offset without an anchor, so re-anchoring one
+                // in Enter moves its X window by the difference between its
+                // output and the parent's. Keeping the anchor limits that to
+                // the first time a reused menu or tooltip opens, as before.
+                let is_popup = data
+                    .get::<&WindowData>()
+                    .is_some_and(|win| win.attrs.role.is_popup());
+                if !is_popup {
+                    cmd.remove_one::<event::OnOutput>(*entity);
+                }
                 if let Some(f) = fractional {
                     f.destroy();
                     cmd.remove_one::<WpFractionalScaleV1>(*entity);
