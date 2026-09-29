@@ -363,7 +363,7 @@ mod tests {
         let index = CursorImageIndex::build(
             &["child".to_owned()],
             names.iter().copied(),
-            &[dir.clone()],
+            std::slice::from_ref(&dir),
             |a, b| (a == "hand2" || a == "pointer") && (b == "hand2" || b == "pointer"),
         );
         std::fs::remove_dir_all(&dir).unwrap();
