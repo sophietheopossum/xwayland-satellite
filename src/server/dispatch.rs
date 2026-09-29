@@ -315,6 +315,15 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                 viewport.destroy();
 
                 cmd.remove::<event::SurfaceBundle>(*entity);
+                // The output anchor belongs to this surface, like the
+                // EnteredOutputs the bundle takes with it. A window keeps its
+                // entity after its surface is destroyed and rootless Xwayland
+                // maps it again with a new surface, which set_serial hands
+                // the window's components; an anchor carried over would pass
+                // the sticky-anchor check in Enter for an output the new
+                // surface never entered, and the window would never
+                // re-anchor to the output it is really on.
+                cmd.remove_one::<event::OnOutput>(*entity);
                 if let Some(f) = fractional {
                     f.destroy();
                     cmd.remove_one::<WpFractionalScaleV1>(*entity);
