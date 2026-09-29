@@ -2315,6 +2315,57 @@ fn remapped_window_anchors_to_the_output_it_enters() {
     f.assert_window_dimensions(window, id, dims);
 }
 
+/// Unlike a toplevel, a reused menu or tooltip keeps its output anchor across
+/// remaps, so reopening it where the client placed it, on an output other than
+/// its parent's, leaves its X window there instead of moving it by the
+/// difference between the two outputs.
+#[test]
+fn reused_popup_on_another_output_is_not_moved_when_reopened() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+
+    let (_, output_a) = f.new_output(0, 0);
+    let (_, output_b) = f.new_output(500, 100);
+    f.run();
+
+    let parent = Window::new(1);
+    let (_, parent_id) = f.create_toplevel(&comp, parent);
+    f.testwl.move_surface_to_output(parent_id, &output_a);
+    f.run();
+
+    let popup = Window::new(2);
+    let (surface, old_id) = f.create_popup(
+        &comp,
+        PopupBuilder::new(popup, parent, parent_id).x(20).y(20),
+    );
+    f.testwl.move_surface_to_output(old_id, &output_b);
+    f.run();
+
+    f.satellite.unmap_window(popup);
+    surface.obj.destroy();
+    f.run();
+
+    // The client puts the menu back where it wants it before mapping it again.
+    let dims = WindowDims {
+        x: 20,
+        y: 20,
+        width: 50,
+        height: 50,
+    };
+    f.reconfigure_window(popup, dims, true);
+
+    let (buffer, surface) = comp.create_surface();
+    f.map_window(&comp, popup, &surface.obj, &buffer);
+    f.run();
+    let id = f.check_new_surface();
+    assert_ne!(id, old_id);
+    f.testwl.configure_popup(id);
+    f.run();
+    f.testwl.move_surface_to_output(id, &output_b);
+    f.run();
+
+    assert_eq!(f.connection().window(popup).dims, dims);
+}
+
 #[test]
 fn output_offset_xdg_override() {
     let (mut f, comp) = TestFixture::new_with_compositor();
