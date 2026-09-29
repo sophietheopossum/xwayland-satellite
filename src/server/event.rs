@@ -481,10 +481,9 @@ impl SurfaceEvents {
                     toplevel.maximized =
                         states.contains(&(u32::from(xdg_toplevel::State::Maximized) as u8));
                     if toplevel.maximized != prev_max {
-                        state.connection.set_maximized(
-                            *data.get::<&x::Window>().unwrap(),
-                            toplevel.maximized,
-                        );
+                        state
+                            .connection
+                            .set_maximized(*data.get::<&x::Window>().unwrap(), toplevel.maximized);
                     }
                 };
 
