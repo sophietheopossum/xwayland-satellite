@@ -4639,6 +4639,15 @@ fn maximized_pre_mapping() {
             .states
             .contains(&xdg_toplevel::State::Maximized)
     );
+
+    // The request never reached _NET_WM_STATE (the window had no role yet), so
+    // the compositor granting it has to put it there, or the client keeps
+    // drawing itself unmaximized while the compositor shows it maximized.
+    f.testwl
+        .configure_toplevel(id, 800, 600, vec![xdg_toplevel::State::Maximized]);
+    f.run();
+    f.run();
+    assert!(f.satellite.connection.windows[&win].maximized);
 }
 
 #[test]

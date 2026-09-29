@@ -611,6 +611,11 @@ impl SurfaceEvents {
 
                 let mut role = data.get::<&mut SurfaceRole>().unwrap();
                 if let SurfaceRole::Toplevel(Some(toplevel)) = &mut *role {
+                    // Still unset while the compositor answers the state the
+                    // toplevel was created with; xdg_event sets it once this
+                    // configure sequence is acked.
+                    let first = !toplevel.xdg.configured;
+
                     let prev_fs = toplevel.fullscreen;
                     toplevel.fullscreen =
                         states.contains(&(u32::from(xdg_toplevel::State::Fullscreen) as u8));
@@ -624,10 +629,15 @@ impl SurfaceEvents {
                         }
                     }
 
+                    // Unlike fullscreen, `maximized` starts out as the state
+                    // create_toplevel asked for, not what _NET_WM_STATE holds:
+                    // a maximize requested before the window had a role only
+                    // reached attrs. So when the first configure grants it,
+                    // "unchanged" can still mean X never heard of it.
                     let prev_max = toplevel.maximized;
                     toplevel.maximized =
                         states.contains(&(u32::from(xdg_toplevel::State::Maximized) as u8));
-                    if toplevel.maximized != prev_max {
+                    if toplevel.maximized != prev_max || (first && toplevel.maximized) {
                         state
                             .connection
                             .set_maximized(*data.get::<&x::Window>().unwrap(), toplevel.maximized);
