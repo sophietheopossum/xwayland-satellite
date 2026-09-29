@@ -210,18 +210,36 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                     let c_region = state.compositor.create_region(&state.qh, ());
                     for op in ops {
                         match op {
-                            RegionOp::Add { x, y, width, height } => {
+                            RegionOp::Add {
+                                x,
+                                y,
+                                width,
+                                height,
+                            } => {
                                 let sx = (x as f64 / scale_x).round() as i32;
                                 let sy = (y as f64 / scale_y).round() as i32;
-                                let sw = (((x as f64 + width as f64) / scale_x).round() as i32 - sx).max(0);
-                                let sh = (((y as f64 + height as f64) / scale_y).round() as i32 - sy).max(0);
+                                let sw = (((x as f64 + width as f64) / scale_x).round() as i32
+                                    - sx)
+                                    .max(0);
+                                let sh = (((y as f64 + height as f64) / scale_y).round() as i32
+                                    - sy)
+                                    .max(0);
                                 c_region.add(sx, sy, sw, sh);
                             }
-                            RegionOp::Subtract { x, y, width, height } => {
+                            RegionOp::Subtract {
+                                x,
+                                y,
+                                width,
+                                height,
+                            } => {
                                 let sx = (x as f64 / scale_x).round() as i32;
                                 let sy = (y as f64 / scale_y).round() as i32;
-                                let sw = (((x as f64 + width as f64) / scale_x).round() as i32 - sx).max(0);
-                                let sh = (((y as f64 + height as f64) / scale_y).round() as i32 - sy).max(0);
+                                let sw = (((x as f64 + width as f64) / scale_x).round() as i32
+                                    - sx)
+                                    .max(0);
+                                let sh = (((y as f64 + height as f64) / scale_y).round() as i32
+                                    - sy)
+                                    .max(0);
                                 c_region.subtract(sx, sy, sw, sh);
                             }
                         }
@@ -257,8 +275,18 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RegionOp {
-    Add { x: i32, y: i32, width: i32, height: i32 },
-    Subtract { x: i32, y: i32, width: i32, height: i32 },
+    Add {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    Subtract {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -285,10 +313,12 @@ impl<S: X11Selection> Dispatch<WlRegion, RegionData> for InnerServerState<S> {
                 width,
                 height,
             } => {
-                data.ops
-                    .lock()
-                    .unwrap()
-                    .push(RegionOp::Add { x, y, width, height });
+                data.ops.lock().unwrap().push(RegionOp::Add {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
             }
             wl_region::Request::Subtract {
                 x,
@@ -296,10 +326,12 @@ impl<S: X11Selection> Dispatch<WlRegion, RegionData> for InnerServerState<S> {
                 width,
                 height,
             } => {
-                data.ops
-                    .lock()
-                    .unwrap()
-                    .push(RegionOp::Subtract { x, y, width, height });
+                data.ops.lock().unwrap().push(RegionOp::Subtract {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
             }
             wl_region::Request::Destroy => {}
             _ => {}

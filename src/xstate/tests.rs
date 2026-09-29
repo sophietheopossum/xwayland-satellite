@@ -561,9 +561,7 @@ mod window_role_heuristics {
     #[test]
     fn regular_dialog_resizable_remains_toplevel() {
         let win_types = WindowTypes::new();
-        let wm_normal_hints = WmNormalHints::new()
-            .min_size(300, 200)
-            .max_size(800, 600);
+        let wm_normal_hints = WmNormalHints::new().min_size(300, 200).max_size(800, 600);
         let win = WindowRoleHeuristics {
             has_transient_for: true,
             motif_wm_hints: Some(motif::Hints::from([0x2_u32, 0x1, 0, 0, 0].as_slice())),
@@ -575,4 +573,3 @@ mod window_role_heuristics {
         assert_eq!(win.guess_window_role(&win_types), WindowRole::Toplevel);
     }
 }
-

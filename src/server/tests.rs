@@ -4025,9 +4025,7 @@ fn test_base_scale_override() {
         .world
         .insert_one(
             output_entity,
-            super::event::TrueOutputScaleFactor(super::event::OutputScaleFactor::Fractional(
-                1.75,
-            )),
+            super::event::TrueOutputScaleFactor(super::event::OutputScaleFactor::Fractional(1.75)),
         )
         .unwrap();
 
@@ -4177,10 +4175,7 @@ fn input_region_scaling() {
 
     let surface_data = f.testwl.get_surface_data(id).unwrap();
     // Scale 2.0 downsamples [20, 40, 200, 100] to [10, 20, 100, 50]
-    assert_eq!(
-        surface_data.input_region,
-        Some(vec![(10, 20, 100, 50)])
-    );
+    assert_eq!(surface_data.input_region, Some(vec![(10, 20, 100, 50)]));
 
     surface
         .send_request(Req::<WlSurface>::SetInputRegion { region: None })

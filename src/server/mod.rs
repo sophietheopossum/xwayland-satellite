@@ -1073,12 +1073,11 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         for (entity, name) in query.iter() {
             if *name == global {
                 self.updated_outputs.push(*entity);
-                let _ = self.world
-                    .remove::<(
-                        OutputScaleFactor,
-                        event::TrueOutputScaleFactor,
-                        OutputDimensions,
-                    )>(*entity);
+                let _ = self.world.remove::<(
+                    OutputScaleFactor,
+                    event::TrueOutputScaleFactor,
+                    OutputDimensions,
+                )>(*entity);
                 let _ = self.world.remove_one::<event::X11OutputPosition>(*entity);
 
                 let mut surfaces_to_update = Vec::new();
