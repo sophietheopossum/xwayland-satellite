@@ -2528,6 +2528,7 @@ fn client_init_move_unspecified_button() {
 
     let win_toplevel = connection.new_window(connection.root, 0, 0, 20, 20, false);
     let surface = f.map_as_toplevel(&mut connection, win_toplevel);
+    connection.get_button_press_events(win_toplevel);
     f.testwl.move_pointer_to(surface, 10., 10.);
     let ptr = f.testwl.pointer();
     ptr.motion(10, 10.0, 10.0);
@@ -2535,6 +2536,10 @@ fn client_init_move_unspecified_button() {
     ptr.button(10, 20, BTN_LEFT, wl_pointer::ButtonState::Pressed);
     ptr.frame();
     f.testwl.dispatch();
+    // As in client_init_move: the request answers the press the client received, so it
+    // must not race ahead of the satellite recording that press's serial.
+    let press = connection.await_button_press();
+    assert_eq!(press.event(), win_toplevel);
 
     connection.send_client_message(&x::ClientMessageEvent::new(
         win_toplevel,
