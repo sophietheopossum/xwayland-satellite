@@ -1,4 +1,5 @@
 mod clientside;
+pub(crate) mod cursor_shape;
 mod decoration;
 mod dispatch;
 mod event;
@@ -34,6 +35,9 @@ use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1
 use wayland_protocols::xdg::shell::client::xdg_positioner::ConstraintAdjustment;
 use wayland_protocols::{
     wp::{
+        cursor_shape::v1::client::{
+            wp_cursor_shape_device_v1::Shape, wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+        },
         fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
         linux_dmabuf::zv1::{client as c_dmabuf, server as s_dmabuf},
         linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
@@ -240,6 +244,7 @@ struct ToplevelData {
     toplevel: XdgToplevel,
     xdg: XdgSurfaceData,
     fullscreen: bool,
+    maximized: bool,
     decoration: decoration::DecorationsData,
 }
 
@@ -439,6 +444,9 @@ impl<S: X11Selection> XConnection for NoConnection<S> {
     fn set_fullscreen(&mut self, _: x::Window, _: bool) {
         debug!("could not toggle fullscreen without XWayland initialized");
     }
+    fn set_maximized(&mut self, _: x::Window, _: bool) {
+        debug!("could not toggle maximized without XWayland initialized");
+    }
     fn set_window_dims(&mut self, _: x::Window, _: crate::server::PendingSurfaceState) -> bool {
         debug!("could not set window dimensions without XWayland initialized");
         false
@@ -491,6 +499,10 @@ pub struct InnerServerState<S: X11Selection> {
     updated_outputs: Vec<Entity>,
     new_scale: Option<f64>,
     current_scale: f64,
+    cursor_shape_manager: Option<WpCursorShapeManagerV1>,
+    /// Cursor-shape equivalent of the X cursor currently displayed, from its
+    /// XFixes name. `None` when it has no name or no equivalent.
+    x_cursor_shape: Option<Shape>,
 }
 
 impl<S: X11Selection> ServerState<NoConnection<S>> {
@@ -553,6 +565,13 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             .bind::<ZxdgDecorationManagerV1, _, _>(&qh, 1..=1, ())
             .ok();
 
+        let cursor_shape_manager = global_list
+            .bind::<WpCursorShapeManagerV1, _, _>(&qh, 1..=1, ())
+            .inspect_err(|e| {
+                warn!("Couldn't bind cursor shape manager: {e}. X cursors will be sent as images.")
+            })
+            .ok();
+
         let selection_states = selection::SelectionStates::new(&global_list, &qh);
 
         dh.create_global::<InnerServerState<S>, XwaylandShellV1, _>(1, ());
@@ -600,6 +619,8 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             updated_outputs: Vec::new(),
             new_scale: None,
             current_scale: 1.0,
+            cursor_shape_manager,
+            x_cursor_shape: None,
             decoration_manager,
             world,
         };
@@ -1193,29 +1214,35 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         self.last_focused_toplevel.unwrap_or(x::WINDOW_NONE)
     }
 
-    pub fn set_fullscreen(&mut self, window: x::Window, state: super::xstate::SetState) {
+    /// Run `f` on the mapped toplevel backing `window`, logging why we couldn't otherwise.
+    /// `action` is spliced into that log, e.g. "set fullscreen on".
+    fn with_toplevel(&self, window: x::Window, action: &str, f: impl FnOnce(&ToplevelData)) {
         let Some(data) = self
             .windows
             .get(&window)
             .copied()
             .and_then(|id| self.world.entity(id).ok())
         else {
-            warn!("Tried to set unknown window {window:?} fullscreen");
+            warn!("Tried to {action} unknown window {window:?}");
             return;
         };
 
         let Some(role) = data.get::<&SurfaceRole>() else {
-            warn!("Tried to set window without role fullscreen: {window:?}");
+            warn!("Tried to {action} window without role: {window:?}");
             return;
         };
 
         let SurfaceRole::Toplevel(Some(toplevel)) = &*role else {
-            warn!("Tried to set an unmapped toplevel or non toplevel fullscreen: {window:?}");
+            warn!("Tried to {action} an unmapped toplevel or non toplevel: {window:?}");
             return;
         };
 
+        f(toplevel);
+    }
+
+    pub fn set_fullscreen(&mut self, window: x::Window, state: super::xstate::SetState) {
         use crate::xstate::SetState;
-        match state {
+        self.with_toplevel(window, "set fullscreen on", |toplevel| match state {
             SetState::Add => toplevel.toplevel.set_fullscreen(None),
             SetState::Remove => toplevel.toplevel.unset_fullscreen(),
             SetState::Toggle => {
@@ -1225,7 +1252,28 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                     toplevel.toplevel.set_fullscreen(None)
                 }
             }
-        }
+        });
+    }
+
+    pub fn set_maximized(&mut self, window: x::Window, state: super::xstate::SetState) {
+        use crate::xstate::SetState;
+        self.with_toplevel(window, "set maximized on", |toplevel| match state {
+            SetState::Add => toplevel.toplevel.set_maximized(),
+            SetState::Remove => toplevel.toplevel.unset_maximized(),
+            SetState::Toggle => {
+                if toplevel.maximized {
+                    toplevel.toplevel.unset_maximized()
+                } else {
+                    toplevel.toplevel.set_maximized()
+                }
+            }
+        });
+    }
+
+    pub fn minimize_window(&mut self, window: x::Window) {
+        self.with_toplevel(window, "minimize", |toplevel| {
+            toplevel.toplevel.set_minimized()
+        });
     }
 
     pub fn set_transient_for(&mut self, window: x::Window, parent: x::Window) {
@@ -1589,6 +1637,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             },
             toplevel,
             fullscreen: false,
+            maximized: false,
             decoration: DecorationsData {
                 wl: wl_decoration,
                 satellite: sat_decoration,
