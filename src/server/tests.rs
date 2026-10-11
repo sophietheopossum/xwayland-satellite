@@ -3282,39 +3282,59 @@ fn output_dpi_keeps_integer_fallback_without_fractional_scale() {
 }
 
 #[test]
-fn fractional_output_v2_commits_on_xdg_done() {
-    let mut f = TestFixture::new_pre_connect(|testwl| testwl.enable_fractional_scale());
-    let _comp = f.compositor();
-    let manager = f.enable_xdg_output_version(2);
-    let (client, output) = f.new_output(0, 0);
-    f.create_xdg_output(&manager, client.obj);
-    let xdg = f.testwl.get_xdg_output(&output).unwrap();
-    output.mode(s_proto::wl_output::Mode::Current, 1500, 1500, 60000);
-    output.scale(2);
-    output.done();
-    f.run();
-    f.run();
-    assert_eq!(f.satellite.current_scale, 2.0);
-    xdg.logical_size(1000, 1000);
-    f.run();
-    f.run();
-    assert_eq!(f.satellite.current_scale, 2.0);
-    xdg.done();
-    f.run();
-    f.run();
-    assert_eq!(f.satellite.current_scale, 1.5);
+fn legacy_output_batches_keep_integer_dpi_and_follow_scale_changes() {
+    for version in [1, 2] {
+        let mut f = TestFixture::new_pre_connect(|testwl| testwl.enable_fractional_scale());
+        let _comp = f.compositor();
+        let manager = f.enable_xdg_output_version(version);
+        let (client, output) = f.new_output(0, 0);
+        f.create_xdg_output(&manager, client.obj);
+        let xdg = f.testwl.get_xdg_output(&output).unwrap();
+        output.mode(s_proto::wl_output::Mode::Current, 1500, 1500, 60000);
+        output.scale(2);
+        output.done();
+        f.run();
+        f.run();
+        xdg.logical_size(1000, 1000);
+        xdg.done();
+        f.run();
+        f.run();
+        assert_eq!(f.satellite.current_scale, 2.0);
 
-    // Legacy xdg events may precede the new physical mode (Smithay's order).
-    // wl_output.done must reconcile the final pair even after xdg.done ran.
-    xdg.logical_size(2000, 2000);
-    xdg.done();
-    f.run();
-    f.run();
-    output.mode(s_proto::wl_output::Mode::Current, 3000, 3000, 60000);
-    output.done();
-    f.run();
-    f.run();
-    assert_eq!(f.satellite.current_scale, 1.5);
+        // Legacy xdg.done cannot commit a coherent pair with wl_output.mode.
+        // Check the intermediate dispatch as well as the completed transition.
+        xdg.logical_size(2000, 2000);
+        xdg.done();
+        f.run();
+        f.run();
+        assert_eq!(f.satellite.current_scale, 2.0, "xdg-output v{version}");
+        output.mode(s_proto::wl_output::Mode::Current, 3000, 3000, 60000);
+        output.done();
+        f.run();
+        f.run();
+        assert_eq!(f.satellite.current_scale, 2.0);
+
+        // Reversed order has the same constraint, including a mode-only update.
+        output.mode(s_proto::wl_output::Mode::Current, 1500, 1500, 60000);
+        output.done();
+        f.run();
+        f.run();
+        assert_eq!(f.satellite.current_scale, 2.0);
+        xdg.logical_size(1000, 1000);
+        xdg.done();
+        f.run();
+        f.run();
+        assert_eq!(f.satellite.current_scale, 2.0);
+
+        // The fallback must keep following real scale changes in both directions.
+        for scale in [3, 1] {
+            output.scale(scale);
+            output.done();
+            f.run();
+            f.run();
+            assert_eq!(f.satellite.current_scale, f64::from(scale));
+        }
+    }
 }
 
 #[test]
@@ -3338,6 +3358,129 @@ fn surface_scale_cannot_replace_integer_output_fallback_without_xdg_output() {
     f.run();
     f.run();
     assert_eq!(f.satellite.current_scale, 2.0);
+}
+
+#[test]
+fn integer_output_updates_preserve_fractional_surface_scale() {
+    fn assert_surface_scale(
+        f: &TestFixture<FakeXConnection>,
+        window: Window,
+        id: testwl::SurfaceId,
+        expected: (f64, i32),
+    ) {
+        let scale = f
+            .satellite
+            .world
+            .get::<&super::event::SurfaceScaleFactor>(f.satellite.windows[&window])
+            .unwrap()
+            .0;
+        let width = f
+            .testwl
+            .get_surface_data(id)
+            .unwrap()
+            .viewport
+            .as_ref()
+            .unwrap()
+            .width;
+        assert_eq!((scale, width), expected);
+    }
+
+    for version in [None, Some(1), Some(2)] {
+        for output_first in [true, false] {
+            let mut f = TestFixture::new_pre_connect(|testwl| testwl.enable_fractional_scale());
+            let comp = f.compositor();
+            let manager = version.map(|v| f.enable_xdg_output_version(v));
+            let (client, output) = f.new_output(0, 0);
+            if let Some(manager) = manager {
+                f.create_xdg_output(&manager, client.obj);
+            }
+            output.scale(2);
+            output.done();
+            f.run();
+            f.run();
+            let window = Window::new(1);
+            let (_, id) = f.create_toplevel(&comp, window);
+            f.testwl.move_surface_to_output(id, &output);
+            f.run();
+            f.run();
+
+            // Before the first preference, retain the surface's initial scale.
+            output.scale(3);
+            output.done();
+            f.run();
+            f.run();
+            assert_surface_scale(&f, window, id, (2.0, 100));
+            let fractional = f
+                .testwl
+                .get_surface_data(id)
+                .unwrap()
+                .fractional
+                .clone()
+                .unwrap();
+            fractional.preferred_scale(180);
+            output.scale(2);
+            output.done();
+            f.run();
+            f.run();
+            assert_surface_scale(&f, window, id, (1.5, 134));
+
+            // Both event orders must preserve the surface preference and viewport.
+            if !output_first {
+                fractional.preferred_scale(270);
+            }
+            output.scale(3);
+            output.done();
+            if output_first {
+                fractional.preferred_scale(270);
+            }
+            f.run();
+            f.run();
+            assert_eq!(f.satellite.current_scale, 3.0);
+            assert_surface_scale(&f, window, id, (2.25, 89));
+
+            // No new preferred_scale is required when only the output changes.
+            output.scale(4);
+            output.done();
+            f.run();
+            f.run();
+            assert_eq!(f.satellite.current_scale, 4.0);
+            assert_surface_scale(&f, window, id, (2.25, 89));
+        }
+    }
+}
+
+#[test]
+fn integer_output_updates_surface_scale_without_fractional_protocol() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let (_, output) = f.new_output(0, 0);
+    output.scale(2);
+    output.done();
+    f.run();
+    f.run();
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    f.run();
+    output.scale(3);
+    output.done();
+    f.run();
+    f.run();
+    let scale = f
+        .satellite
+        .world
+        .get::<&super::event::SurfaceScaleFactor>(f.satellite.windows[&window])
+        .unwrap()
+        .0;
+    let width = f
+        .testwl
+        .get_surface_data(id)
+        .unwrap()
+        .viewport
+        .as_ref()
+        .unwrap()
+        .width;
+    assert_eq!((f.satellite.current_scale, scale, width), (3.0, 3.0, 67));
 }
 
 #[test]
