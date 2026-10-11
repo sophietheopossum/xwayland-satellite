@@ -104,14 +104,6 @@ impl Event for SurfaceEvents {
 
                     entity.get::<&mut SurfaceScaleFactor>().unwrap().0 = factor;
 
-                    if let Some(OnOutput(output)) = entity.get::<&OnOutput>().as_deref().copied() {
-                        if update_output_scale(
-                            state.world.query_one(output).unwrap(),
-                            OutputScaleFactor::Fractional(factor),
-                        ) {
-                            state.updated_outputs.push(output);
-                        }
-                    }
                     if entity.has::<WindowData>() {
                         update_surface_viewport(
                             &state.world,
@@ -237,14 +229,6 @@ impl SurfaceEvents {
                             &state.world,
                             state.world.query_one(target).unwrap(),
                         );
-                    } else {
-                        let scale = data.get::<&SurfaceScaleFactor>().unwrap();
-                        if update_output_scale(
-                            state.world.query_one(on_output.0).unwrap(),
-                            OutputScaleFactor::Fractional(scale.0),
-                        ) {
-                            state.updated_outputs.push(on_output.0);
-                        }
                     }
                 }
                 cmd.insert_one(target, on_output);
@@ -1066,6 +1050,7 @@ pub(super) struct OutputDimensions {
     pub width: i32,
     pub height: i32,
     rotated_90: bool,
+    logical_size: Option<(i32, i32)>,
 }
 
 impl Default for OutputDimensions {
@@ -1084,7 +1069,30 @@ impl Default for OutputDimensions {
             width: 0,
             height: 0,
             rotated_90: false,
+            logical_size: None,
         }
+    }
+}
+
+impl OutputDimensions {
+    fn fractional_scale(&self) -> Option<f64> {
+        let (logical_width, logical_height) = self.logical_size?;
+        if self.width <= 0 || self.height <= 0 || logical_width <= 0 || logical_height <= 0 {
+            return None;
+        }
+        let (width, height) = if self.rotated_90 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+        // Logical output sizes are rounded to integers. Use the longer axis
+        // and round the estimate to the fractional-scale protocol's 1/120 units.
+        let scale = if logical_width >= logical_height {
+            f64::from(width) / f64::from(logical_width)
+        } else {
+            f64::from(height) / f64::from(logical_height)
+        };
+        Some((scale * 120.0).round().max(1.0) / 120.0)
     }
 }
 
@@ -1245,6 +1253,25 @@ impl Event for OutputEvent {
 }
 
 impl OutputEvent {
+    fn update_fractional_scale<C: XConnection>(target: Entity, state: &mut ServerState<C>) {
+        if state.fractional_scale.is_none() {
+            return;
+        }
+        let factor = state
+            .world
+            .get::<&OutputDimensions>(target)
+            .ok()
+            .and_then(|dimensions| dimensions.fractional_scale());
+        if let Some(factor) = factor {
+            if update_output_scale(
+                state.world.query_one(target).unwrap(),
+                OutputScaleFactor::Fractional(factor),
+            ) {
+                state.updated_outputs.push(target);
+            }
+        }
+    }
+
     fn wl_event<C: XConnection>(
         event: client::wl_output::Event,
         target: Entity,
@@ -1367,7 +1394,19 @@ impl OutputEvent {
                     .name(name.clone());
                 state.world.insert(target, (OutputName(name),)).unwrap();
             }
-            Event::Done {} => {
+            Event::Done => {
+                // A surface can overlap several outputs, and its preferred
+                // scale need not belong to the last output it entered. Derive
+                // global X11 DPI from output geometry, after its atomic batch.
+                if state
+                    .world
+                    .get::<&zxdg_output_v1::ZxdgOutputV1>(target)
+                    .is_ok()
+                {
+                    // Legacy xdg.done can precede wl.mode/geometry, so those
+                    // versions also need a refresh when the wl batch completes.
+                    Self::update_fractional_scale(target, state);
+                }
                 let Ok((output, xdg)) = state
                     .world
                     .query_one_mut::<(&WlOutput, Option<&XdgOutputServer>)>(target)
@@ -1409,23 +1448,34 @@ impl OutputEvent {
                         );
                 }
             }
-            Event::LogicalSize { .. } => {
+            Event::LogicalSize { width, height } => {
                 let Ok((xdg, dimensions)) = state
                     .world
-                    .query_one_mut::<(&XdgOutputServer, &OutputDimensions)>(target)
+                    .query_one_mut::<(&XdgOutputServer, &mut OutputDimensions)>(target)
                 else {
                     return;
                 };
+                dimensions.logical_size = Some((width, height));
                 if dimensions.rotated_90 {
                     xdg.logical_size(dimensions.height, dimensions.width);
                 } else {
                     xdg.logical_size(dimensions.width, dimensions.height);
                 }
             }
+            Event::Done => {
+                // xdg-output v1/v2 terminate their batch here; v3 uses wl_output.done.
+                if state
+                    .world
+                    .get::<&zxdg_output_v1::ZxdgOutputV1>(target)
+                    .is_ok_and(|xdg| xdg.version() < 3)
+                {
+                    Self::update_fractional_scale(target, state);
+                }
+                state.world.get::<&XdgOutputServer>(target).unwrap().done();
+            }
             _ => simple_event_shunt! {
                 state.world.get::<&XdgOutputServer>(target).unwrap(),
                 event: zxdg_output_v1::Event => [
-                    Done,
                     Name { name },
                     Description { description }
                 ]
