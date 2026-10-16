@@ -680,9 +680,9 @@ impl XState {
             );
         }
         server_state.set_window_role(window, role);
-        if let Some(parent) = transient_for.and_then(|t| (!role.is_popup()).then_some(t)) {
-            server_state.set_transient_for(window, parent);
-        }
+        // Fixed-size utility windows can become popups, but still carry their
+        // explicit X11 parent. Also clear the remembered parent on removal.
+        server_state.set_transient_for(window, transient_for);
 
         Ok(())
     }

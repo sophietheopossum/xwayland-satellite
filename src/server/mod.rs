@@ -1228,7 +1228,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         }
     }
 
-    pub fn set_transient_for(&mut self, window: x::Window, parent: x::Window) {
+    pub fn set_transient_for(&mut self, window: x::Window, parent: Option<x::Window>) {
         let Some(mut win) = self
             .windows
             .get(&window)
@@ -1239,7 +1239,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             return;
         };
 
-        win.attrs.transient_for = Some(parent);
+        win.attrs.transient_for = parent;
     }
 
     pub fn activate_window(&mut self, window: x::Window) {
@@ -1396,6 +1396,35 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         }
     }
 
+    /// XDG popup parents must still have a live, configured role. In particular,
+    /// X11 group leaders, stale window IDs and the popup itself are not parents.
+    fn popup_parent(&self, window: x::Window, explicit: Option<x::Window>) -> Option<x::Window> {
+        [explicit, self.last_hovered, self.last_focused_toplevel]
+            .into_iter()
+            .flatten()
+            .find(|parent| {
+                if *parent == window {
+                    return false;
+                }
+                let Some(entity) = self.windows.get(parent).copied() else {
+                    return false;
+                };
+                let Ok(mut query) = self
+                    .world
+                    .query_one::<(&WindowData, &SurfaceScaleFactor, &SurfaceRole)>(entity)
+                else {
+                    return false;
+                };
+                let Some((data, _, role)) = query.get() else {
+                    return false;
+                };
+                data.mapped
+                    && role
+                        .xdg()
+                        .is_some_and(|xdg| xdg.configured && xdg.surface.is_alive())
+            })
+    }
+
     /// Creates the appropriate xdg role (toplevel or popup) for the given window.
     /// Returns `true` if the created window is a toplevel.
     fn create_role_window(&mut self, window: x::Window, entity: Entity) -> bool {
@@ -1414,7 +1443,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
             let window_data = data.get::<&WindowData>().unwrap();
             if window_data.attrs.role.is_popup() {
-                popup_for = self.last_hovered.or(self.last_focused_toplevel);
+                popup_for = self.popup_parent(window, window_data.attrs.transient_for);
             }
             splash = window_data.attrs.role == WindowRole::Splash;
 
