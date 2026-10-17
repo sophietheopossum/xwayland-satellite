@@ -3561,3 +3561,148 @@ fn popup_without_a_valid_parent_becomes_toplevel() {
         Some(testwl::SurfaceRole::Toplevel(_))
     ));
 }
+
+#[test]
+fn popup_uses_unique_group_parent_before_other_application_hover() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+    let parent = Window::new(1);
+    let (_, parent_id) = f.create_toplevel(&comp, parent);
+    let group = Window::new(99);
+    let entity = f.satellite.windows[&parent];
+    f.satellite
+        .world
+        .get::<&mut super::WindowData>(entity)
+        .unwrap()
+        .attrs
+        .group = Some(group);
+    let other = Window::new(2);
+    let (_, other_id) = f.create_toplevel(&comp, other);
+    f.testwl.move_pointer_to(other_id, 1.0, 1.0);
+    f.run();
+    let popup = Window::new(3);
+    let (buffer, surface) = comp.create_surface();
+    f.new_window(
+        popup,
+        true,
+        WindowData {
+            mapped: true,
+            dims: WindowDims {
+                x: 104,
+                y: 0,
+                width: 54,
+                height: 506,
+            },
+            ..Default::default()
+        },
+    );
+    let entity = f.satellite.windows[&popup];
+    f.satellite
+        .world
+        .get::<&mut super::WindowData>(entity)
+        .unwrap()
+        .attrs
+        .group = Some(group);
+    f.map_window(&comp, popup, &surface.obj, &buffer);
+    f.run();
+    let popup_id = f.check_new_surface();
+    let data = f.testwl.get_surface_data(popup_id).unwrap();
+    assert_eq!(
+        data.popup().parent.id(),
+        f.testwl
+            .get_surface_data(parent_id)
+            .unwrap()
+            .xdg()
+            .surface
+            .id()
+    );
+}
+
+#[test]
+fn popup_reposition_is_relative_to_the_selected_parent() {
+    for scale in [1, 2] {
+        let (mut f, comp) = TestFixture::new_with_compositor();
+        let (_, output) = f.new_output(500, 720);
+        output.scale(scale);
+        output.done();
+        f.run();
+        f.run();
+        let root = Window::new(1);
+        let (_, root_id) = f.create_toplevel(&comp, root);
+        f.testwl.move_surface_to_output(root_id, &output);
+        f.run();
+        let parent = Window::new(2);
+        let (_, parent_id) = f.create_popup(
+            &comp,
+            PopupBuilder::new(parent, root, root_id)
+                .transient_for(root)
+                .x(540)
+                .y(760)
+                .scale(scale),
+        );
+        f.testwl.move_surface_to_output(parent_id, &output);
+        f.run();
+        let pd = f.connection().windows[&parent].dims;
+        let popup = Window::new(3);
+        let (_, popup_id) = f.create_popup(
+            &comp,
+            PopupBuilder::new(popup, parent, parent_id)
+                .transient_for(parent)
+                .x(pd.x + 20 * scale as i16)
+                .y(pd.y + 10 * scale as i16)
+                .scale(scale),
+        );
+        let new_dims = WindowDims {
+            x: pd.x + 30 * scale as i16,
+            y: pd.y + 15 * scale as i16,
+            width: 50,
+            height: 50,
+        };
+        f.reconfigure_window(popup, new_dims, true);
+        f.run();
+        f.run();
+        let data = f.testwl.get_surface_data(popup_id).unwrap();
+        assert_eq!(
+            data.popup().positioner_state.offset,
+            testwl::Vec2 { x: 30, y: 15 }
+        );
+    }
+}
+
+#[test]
+fn popup_group_fallback_is_unambiguous_and_keeps_explicit_priority() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+    let group = Window::new(99);
+    let a = Window::new(1);
+    let b = Window::new(2);
+    for window in [a, b] {
+        f.create_toplevel(&comp, window);
+        let entity = f.satellite.windows[&window];
+        f.satellite
+            .world
+            .get::<&mut super::WindowData>(entity)
+            .unwrap()
+            .attrs
+            .group = Some(group);
+    }
+    let other = Window::new(3);
+    let (_, other_id) = f.create_toplevel(&comp, other);
+    f.testwl.move_pointer_to(other_id, 1.0, 1.0);
+    f.run();
+    let popup = Window::new(4);
+    f.new_window(popup, true, WindowData::default());
+    let entity = f.satellite.windows[&popup];
+    f.satellite
+        .world
+        .get::<&mut super::WindowData>(entity)
+        .unwrap()
+        .attrs
+        .group = Some(group);
+    assert_eq!(f.satellite.popup_parent(popup, None), Some(other));
+    assert_eq!(f.satellite.popup_parent(popup, Some(a)), Some(a));
+    f.satellite.unmap_window(b);
+    f.run();
+    assert_eq!(f.satellite.popup_parent(popup, None), Some(a));
+    assert_eq!(f.satellite.popup_parent(popup, Some(other)), Some(other));
+}

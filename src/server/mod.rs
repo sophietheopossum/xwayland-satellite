@@ -245,6 +245,7 @@ struct ToplevelData {
 
 #[derive(Debug)]
 struct PopupData {
+    parent: x::Window,
     popup: XdgPopup,
     positioner: XdgPositioner,
     xdg: XdgSurfaceData,
@@ -1080,6 +1081,18 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
     }
 
     pub fn reconfigure_window(&mut self, event: x::ConfigureNotifyEvent) {
+        // Read the parent's origin before borrowing this window's archetype mutably.
+        let popup_parent_dims = self
+            .windows
+            .get(&event.window())
+            .and_then(|id| self.world.get::<&SurfaceRole>(*id).ok())
+            .and_then(|role| match &*role {
+                SurfaceRole::Popup(Some(popup)) => Some(popup.parent),
+                _ => None,
+            })
+            .and_then(|parent| self.windows.get(&parent))
+            .and_then(|id| self.world.get::<&WindowData>(*id).ok())
+            .map(|parent| parent.attrs.dims);
         let Some((mut win, data)) = self
             .windows
             .get(&event.window())
@@ -1121,9 +1134,13 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
         match role {
             SurfaceRole::Popup(Some(popup)) => {
+                let Some(parent_dims) = popup_parent_dims else {
+                    warn!("Not repositioning popup with a destroyed parent");
+                    return;
+                };
                 popup.positioner.set_offset(
-                    ((event.x() as i32 - win.output_offset.x) as f64 / scale_factor.0) as i32,
-                    ((event.y() as i32 - win.output_offset.y) as f64 / scale_factor.0) as i32,
+                    ((event.x() as i32 - parent_dims.x as i32) as f64 / scale_factor.0) as i32,
+                    ((event.y() as i32 - parent_dims.y as i32) as f64 / scale_factor.0) as i32,
                 );
                 popup.positioner.set_size(
                     1.max((event.width() as f64 / scale_factor.0).ceil() as i32),
@@ -1399,30 +1416,60 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
     /// XDG popup parents must still have a live, configured role. In particular,
     /// X11 group leaders, stale window IDs and the popup itself are not parents.
     fn popup_parent(&self, window: x::Window, explicit: Option<x::Window>) -> Option<x::Window> {
-        [explicit, self.last_hovered, self.last_focused_toplevel]
+        let valid = |parent: x::Window| {
+            if parent == window {
+                return false;
+            }
+            let Some(entity) = self.windows.get(&parent).copied() else {
+                return false;
+            };
+            let Ok(mut query) = self
+                .world
+                .query_one::<(&WindowData, &SurfaceScaleFactor, &SurfaceRole)>(entity)
+            else {
+                return false;
+            };
+            let Some((data, _, role)) = query.get() else {
+                return false;
+            };
+            data.mapped
+                && role
+                    .xdg()
+                    .is_some_and(|xdg| xdg.configured && xdg.surface.is_alive())
+        };
+        if let Some(parent) = explicit.filter(|parent| valid(*parent)) {
+            return Some(parent);
+        }
+        // A utility may publish WM_TRANSIENT_FOR after mapping. A unique live
+        // toplevel in its X11 group is safer than an unrelated hovered app.
+        let group = self
+            .windows
+            .get(&window)
+            .and_then(|id| self.world.get::<&WindowData>(*id).ok())
+            .and_then(|data| data.attrs.group);
+        if let Some(group) = group {
+            let mut members = self.windows.iter().filter_map(|(parent, entity)| {
+                if !valid(*parent) {
+                    return None;
+                }
+                let mut query = self
+                    .world
+                    .query_one::<(&WindowData, &SurfaceRole)>(*entity)
+                    .ok()?;
+                let (data, role) = query.get()?;
+                (data.attrs.group == Some(group) && matches!(role, SurfaceRole::Toplevel(Some(_))))
+                    .then_some(*parent)
+            });
+            if let Some(parent) = members.next() {
+                if members.next().is_none() {
+                    return Some(parent);
+                }
+            }
+        }
+        [self.last_hovered, self.last_focused_toplevel]
             .into_iter()
             .flatten()
-            .find(|parent| {
-                if *parent == window {
-                    return false;
-                }
-                let Some(entity) = self.windows.get(parent).copied() else {
-                    return false;
-                };
-                let Ok(mut query) = self
-                    .world
-                    .query_one::<(&WindowData, &SurfaceScaleFactor, &SurfaceRole)>(entity)
-                else {
-                    return false;
-                };
-                let Some((data, _, role)) = query.get() else {
-                    return false;
-                };
-                data.mapped
-                    && role
-                        .xdg()
-                        .is_some_and(|xdg| xdg.configured && xdg.surface.is_alive())
-            })
+            .find(|parent| valid(*parent))
     }
 
     /// Creates the appropriate xdg role (toplevel or popup) for the given window.
@@ -1675,6 +1722,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         );
 
         PopupData {
+            parent,
             popup,
             positioner,
             xdg: XdgSurfaceData {
