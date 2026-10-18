@@ -51,6 +51,96 @@ use wayland_server::protocol::{
 #[derive(Copy, Clone)]
 pub(super) struct SurfaceScaleFactor(pub f64);
 
+/// Pixel size of a buffer, recorded when Xwayland creates it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) struct BufferSize {
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Nominal cursor size in logical pixels: `XCURSOR_SIZE`, or libXcursor's
+/// default of 24.
+pub(super) fn cursor_base_size() -> i32 {
+    static SIZE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("XCURSOR_SIZE")
+            .ok()
+            .and_then(|size| size.trim().parse().ok())
+            .filter(|&size: &i32| size > 0)
+            .unwrap_or(24)
+    })
+}
+
+/// The object a cursor surface was set on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum CursorOwner {
+    Pointer(Entity),
+    TabletTool(Entity),
+}
+
+/// A surface Xwayland has handed to `wl_pointer.set_cursor` or
+/// `zwp_tablet_tool_v2.set_cursor`.
+///
+/// X clients that follow `Xft.dpi` draw their cursors scaled by the same factor
+/// as their windows, and those cursors have to be shrunk back to logical size
+/// like the windows are (with a viewport). Clients that ignore the DPI, or read
+/// a fixed `XCURSOR_SIZE`, draw the nominal size instead, and shrinking those
+/// makes them tiny. Both can happen inside one application (a GTK part and a
+/// self-drawn part, e.g. the Unity editor), so the factor is chosen per cursor
+/// image: `scale` or 1, whichever brings the image closer to the nominal size.
+///
+/// Xwayland sends `set_cursor` before it attaches the image, so the hotspot is
+/// first forwarded with the factor used last and sent again, corrected, when
+/// the image turns out to need the other one.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) struct CursorSurface {
+    /// X-side scale when the cursor was set.
+    pub scale: f64,
+    pub owner: CursorOwner,
+    pub serial: u32,
+    /// Hotspot in X pixels, as Xwayland sent it.
+    pub hotspot: (i32, i32),
+    /// Factor the forwarded hotspot and viewport are currently divided by.
+    pub factor: f64,
+}
+
+impl CursorSurface {
+    /// Divide by `scale` or by 1, whichever lands closer to `base` in ratio
+    /// terms. Ties go to `scale`, i.e. to trusting the DPI.
+    pub fn factor_for(scale: f64, base: i32, size: BufferSize) -> f64 {
+        let longest = size.width.max(size.height);
+        if scale == 1.0 || longest <= 0 || base <= 0 {
+            return 1.0;
+        }
+        let distance = |factor: f64| (longest as f64 / factor / base as f64).ln().abs();
+        if distance(scale) <= distance(1.0) {
+            scale
+        } else {
+            1.0
+        }
+    }
+
+    /// Viewport destination for an image of `size` X pixels, or `None` to
+    /// leave the viewport unset when nothing is scaled.
+    pub fn destination(&self, size: BufferSize) -> Option<(i32, i32)> {
+        if self.factor == 1.0 || size.width <= 0 || size.height <= 0 {
+            return None;
+        }
+        Some((
+            ((size.width as f64 / self.factor).round() as i32).max(1),
+            ((size.height as f64 / self.factor).round() as i32).max(1),
+        ))
+    }
+
+    /// The hotspot in logical coordinates under the current factor.
+    pub fn logical_hotspot(&self) -> (i32, i32) {
+        (
+            (self.hotspot.0 as f64 / self.factor).round() as i32,
+            (self.hotspot.1 as f64 / self.factor).round() as i32,
+        )
+    }
+}
+
 #[derive(hecs::Bundle)]
 pub(super) struct SurfaceBundle {
     pub client: client::wl_surface::WlSurface,
@@ -104,14 +194,6 @@ impl Event for SurfaceEvents {
 
                     entity.get::<&mut SurfaceScaleFactor>().unwrap().0 = factor;
 
-                    if let Some(OnOutput(output)) = entity.get::<&OnOutput>().as_deref().copied() {
-                        if update_output_scale(
-                            state.world.query_one(output).unwrap(),
-                            OutputScaleFactor::Fractional(factor),
-                        ) {
-                            state.updated_outputs.push(output);
-                        }
-                    }
                     if entity.has::<WindowData>() {
                         update_surface_viewport(
                             &state.world,
@@ -237,14 +319,6 @@ impl SurfaceEvents {
                             &state.world,
                             state.world.query_one(target).unwrap(),
                         );
-                    } else {
-                        let scale = data.get::<&SurfaceScaleFactor>().unwrap();
-                        if update_output_scale(
-                            state.world.query_one(on_output.0).unwrap(),
-                            OutputScaleFactor::Fractional(scale.0),
-                        ) {
-                            state.updated_outputs.push(on_output.0);
-                        }
                     }
                 }
                 cmd.insert_one(target, on_output);
@@ -398,6 +472,15 @@ impl SurfaceEvents {
                         if let Some(decorations) = toplevel.decoration.satellite.as_mut() {
                             decorations.handle_fullscreen(toplevel.fullscreen);
                         }
+                    }
+
+                    let prev_max = toplevel.maximized;
+                    toplevel.maximized =
+                        states.contains(&(u32::from(xdg_toplevel::State::Maximized) as u8));
+                    if toplevel.maximized != prev_max {
+                        state
+                            .connection
+                            .set_maximized(*data.get::<&x::Window>().unwrap(), toplevel.maximized);
                     }
                 };
 
@@ -1066,6 +1149,7 @@ pub(super) struct OutputDimensions {
     pub width: i32,
     pub height: i32,
     rotated_90: bool,
+    logical_size: Option<(i32, i32)>,
 }
 
 impl Default for OutputDimensions {
@@ -1084,7 +1168,30 @@ impl Default for OutputDimensions {
             width: 0,
             height: 0,
             rotated_90: false,
+            logical_size: None,
         }
+    }
+}
+
+impl OutputDimensions {
+    fn fractional_scale(&self) -> Option<f64> {
+        let (logical_width, logical_height) = self.logical_size?;
+        if self.width <= 0 || self.height <= 0 || logical_width <= 0 || logical_height <= 0 {
+            return None;
+        }
+        let (width, height) = if self.rotated_90 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+        // Logical output sizes are rounded to integers. Use the longer axis
+        // and round the estimate to the fractional-scale protocol's 1/120 units.
+        let scale = if logical_width >= logical_height {
+            f64::from(width) / f64::from(logical_width)
+        } else {
+            f64::from(height) / f64::from(logical_height)
+        };
+        Some((scale * 120.0).round().max(1.0) / 120.0)
     }
 }
 
@@ -1245,6 +1352,33 @@ impl Event for OutputEvent {
 }
 
 impl OutputEvent {
+    fn update_fractional_scale<C: XConnection>(target: Entity, state: &mut ServerState<C>) {
+        // Only v3 commits logical size and wl_output mode/transform together.
+        // Older xdg.done batches cannot be paired reliably with wl_output.done,
+        // so retain their integer output scale instead of mixing generations.
+        if state.fractional_scale.is_none()
+            || !state
+                .world
+                .get::<&zxdg_output_v1::ZxdgOutputV1>(target)
+                .is_ok_and(|xdg| xdg.version() >= 3)
+        {
+            return;
+        }
+        let factor = state
+            .world
+            .get::<&OutputDimensions>(target)
+            .ok()
+            .and_then(|dimensions| dimensions.fractional_scale());
+        if let Some(factor) = factor {
+            if update_output_scale(
+                state.world.query_one(target).unwrap(),
+                OutputScaleFactor::Fractional(factor),
+            ) {
+                state.updated_outputs.push(target);
+            }
+        }
+    }
+
     fn wl_event<C: XConnection>(
         event: client::wl_output::Event,
         target: Entity,
@@ -1359,11 +1493,17 @@ impl OutputEvent {
                     .name(name.clone());
                 state.world.insert(target, (OutputName(name),)).unwrap();
             }
+            Event::Done => {
+                // A surface can overlap several outputs, and its preferred
+                // scale need not belong to the last output it entered. Derive
+                // global X11 DPI from output geometry, after its atomic batch.
+                Self::update_fractional_scale(target, state);
+                state.world.get::<&WlOutput>(target).unwrap().done();
+            }
             _ => simple_event_shunt! {
                 state.world.get::<&WlOutput>(target).unwrap(),
                 event: client::wl_output::Event => [
-                    Description { description },
-                    Done
+                    Description { description }
                 ]
             },
         }
@@ -1390,13 +1530,14 @@ impl OutputEvent {
                         );
                 }
             }
-            Event::LogicalSize { .. } => {
+            Event::LogicalSize { width, height } => {
                 let Ok((xdg, dimensions)) = state
                     .world
-                    .query_one_mut::<(&XdgOutputServer, &OutputDimensions)>(target)
+                    .query_one_mut::<(&XdgOutputServer, &mut OutputDimensions)>(target)
                 else {
                     return;
                 };
+                dimensions.logical_size = Some((width, height));
                 if dimensions.rotated_90 {
                     xdg.logical_size(dimensions.height, dimensions.width);
                 } else {
