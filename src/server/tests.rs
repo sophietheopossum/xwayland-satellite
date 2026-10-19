@@ -363,6 +363,7 @@ struct PopupBuilder {
     dims: WindowDims,
     scale: f64,
     check_size_and_pos: bool,
+    transient_for: Option<Window>,
 }
 
 impl PopupBuilder {
@@ -379,7 +380,13 @@ impl PopupBuilder {
             },
             scale: 1.0,
             check_size_and_pos: true,
+            transient_for: None,
         }
+    }
+
+    fn transient_for(mut self, parent: Window) -> Self {
+        self.transient_for = Some(parent);
+        self
     }
 
     fn x(mut self, x: i16) -> Self {
@@ -902,6 +909,7 @@ impl TestFixture<FakeXConnection> {
             dims,
             scale,
             check_size_and_pos,
+            transient_for,
         } = builder;
 
         let data = WindowData {
@@ -910,7 +918,12 @@ impl TestFixture<FakeXConnection> {
             fullscreen: false,
             maximized: false,
         };
-        self.new_window(window, true, data);
+        self.new_window(window, transient_for.is_none(), data);
+        if let Some(parent) = transient_for {
+            self.satellite
+                .set_window_role(window, crate::xstate::WindowRole::Popup);
+            self.satellite.set_transient_for(window, Some(parent));
+        }
         self.map_window(comp, window, &surface.obj, &buffer);
         self.run();
 
@@ -2986,7 +2999,7 @@ fn transient_for_toplevel() {
         },
     );
 
-    f.satellite.set_transient_for(sub_toplevel, toplevel);
+    f.satellite.set_transient_for(sub_toplevel, Some(toplevel));
     f.map_window(&comp, sub_toplevel, &surface.obj, &buffer);
     f.run();
     let id = f.check_new_surface();
@@ -4646,7 +4659,7 @@ fn reconfigure_popup_with_decorations() {
             .y(40)
             .check_size_and_pos(false),
     );
-    f.satellite.set_transient_for(popup, toplevel);
+    f.satellite.set_transient_for(popup, Some(toplevel));
 
     let surface_data = f.testwl.get_surface_data(p_id).unwrap();
     let pos = &surface_data.popup().positioner_state;
@@ -5041,4 +5054,339 @@ fn surface_destroy_with_active_input_region() {
     f.run();
 
     assert!(f.testwl.get_surface_data(id).is_none());
+}
+
+#[test]
+fn popup_transient_parent_overrides_other_application_hover_and_focus() {
+    for scale in [1, 2] {
+        let (mut f, comp) = TestFixture::new_with_compositor();
+        let (_, output) = f.new_output(500, 100);
+        output.scale(scale);
+        output.done();
+        f.run();
+        f.run();
+        TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+        let parent = Window::new(1);
+        let (_, parent_id) = f.create_toplevel(&comp, parent);
+        f.testwl.move_surface_to_output(parent_id, &output);
+        f.run();
+        let other_app = Window::new(2);
+        let (_, other_id) = f.create_toplevel(&comp, other_app);
+        f.testwl.move_pointer_to(other_id, 1.0, 1.0);
+        f.run();
+        assert_eq!(f.satellite.last_hovered, Some(other_app));
+        assert_eq!(f.satellite.last_focused_toplevel, Some(other_app));
+        let dims = f.connection().windows[&parent].dims;
+        let popup = Window::new(3);
+        let (surface, popup_id) = f.create_popup(
+            &comp,
+            PopupBuilder::new(popup, parent, parent_id)
+                .transient_for(parent)
+                .x(dims.x + 54 * scale as i16)
+                .y(dims.y + 20 * scale as i16)
+                .scale(scale),
+        );
+        // Remapping must choose the explicit parent again, even after focus
+        // has changed, without retaining a stale Wayland role.
+        f.satellite.unmap_window(popup);
+        surface.obj.destroy();
+        f.run();
+        assert!(f.testwl.get_surface_data(popup_id).is_none());
+        let (buffer, surface) = comp.create_surface();
+        f.satellite.map_window(popup);
+        f.map_window(&comp, popup, &surface.obj, &buffer);
+        f.run();
+        let remapped = f.check_new_surface();
+        let data = f.testwl.get_surface_data(remapped).unwrap();
+        assert_eq!(
+            data.popup().parent.id(),
+            f.testwl
+                .get_surface_data(parent_id)
+                .unwrap()
+                .xdg()
+                .surface
+                .id()
+        );
+    }
+}
+
+#[test]
+fn popup_invalid_transient_parent_uses_existing_fallback() {
+    for invalid in [
+        "unknown",
+        "self",
+        "unmapped",
+        "destroyed",
+        "no-role",
+        "unconfigured",
+    ] {
+        let (mut f, comp) = TestFixture::new_with_compositor();
+        TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+        let invalid_parent = Window::new(1);
+        if matches!(invalid, "unmapped" | "destroyed" | "unconfigured") {
+            f.create_toplevel(&comp, invalid_parent);
+            if invalid == "unconfigured" {
+                let entity = f.satellite.windows[&invalid_parent];
+                f.satellite
+                    .world
+                    .get::<&mut super::SurfaceRole>(entity)
+                    .unwrap()
+                    .xdg_mut()
+                    .unwrap()
+                    .configured = false;
+            } else {
+                f.satellite.unmap_window(invalid_parent);
+                if invalid == "destroyed" {
+                    f.satellite.destroy_window(invalid_parent);
+                }
+                f.run();
+            }
+        } else if invalid == "no-role" {
+            f.new_window(invalid_parent, false, WindowData::default());
+            f.satellite.map_window(invalid_parent);
+        }
+        let fallback = Window::new(2);
+        let (_, fallback_id) = f.create_toplevel(&comp, fallback);
+        f.testwl.move_pointer_to(fallback_id, 1.0, 1.0);
+        f.run();
+        let popup = Window::new(3);
+        let explicit = if invalid == "self" {
+            popup
+        } else {
+            invalid_parent
+        };
+        f.create_popup(
+            &comp,
+            PopupBuilder::new(popup, fallback, fallback_id).transient_for(explicit),
+        );
+    }
+}
+
+#[test]
+fn popup_stale_hover_uses_focused_parent() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let parent = Window::new(1);
+    let (_, parent_id) = f.create_toplevel(&comp, parent);
+    f.satellite.last_hovered = Some(Window::new(99));
+    f.create_popup(&comp, PopupBuilder::new(Window::new(2), parent, parent_id));
+}
+
+#[test]
+fn popup_transient_parent_can_be_cleared_before_remap() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let parent = Window::new(1);
+    let (_, parent_id) = f.create_toplevel(&comp, parent);
+    let fallback = Window::new(2);
+    let (_, fallback_id) = f.create_toplevel(&comp, fallback);
+    let popup = Window::new(3);
+    let (surface, _) = f.create_popup(
+        &comp,
+        PopupBuilder::new(popup, parent, parent_id).transient_for(parent),
+    );
+    f.satellite.unmap_window(popup);
+    surface.obj.destroy();
+    f.satellite.set_transient_for(popup, None);
+    f.run();
+    f.satellite.last_hovered = None;
+    f.satellite.last_focused_toplevel = Some(fallback);
+    let (buffer, surface) = comp.create_surface();
+    f.map_window(&comp, popup, &surface.obj, &buffer);
+    f.run();
+    let remapped = f.check_new_surface();
+    assert_eq!(
+        f.testwl
+            .get_surface_data(remapped)
+            .unwrap()
+            .popup()
+            .parent
+            .id(),
+        f.testwl
+            .get_surface_data(fallback_id)
+            .unwrap()
+            .xdg()
+            .surface
+            .id()
+    );
+}
+
+#[test]
+fn popup_explicit_parent_can_be_an_active_popup() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let root = Window::new(1);
+    let (_, root_id) = f.create_toplevel(&comp, root);
+    let popup = Window::new(2);
+    let (_, popup_id) = f.create_popup(
+        &comp,
+        PopupBuilder::new(popup, root, root_id).transient_for(root),
+    );
+    let other = Window::new(3);
+    f.create_toplevel(&comp, other);
+    f.satellite.last_hovered = Some(other);
+    f.create_popup(
+        &comp,
+        PopupBuilder::new(Window::new(4), popup, popup_id).transient_for(popup),
+    );
+}
+
+#[test]
+fn popup_without_a_valid_parent_becomes_toplevel() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let popup = Window::new(1);
+    let (buffer, surface) = comp.create_surface();
+    f.new_window(popup, false, WindowData::default());
+    f.satellite
+        .set_window_role(popup, crate::xstate::WindowRole::Popup);
+    f.satellite.set_transient_for(popup, Some(Window::new(99)));
+    f.map_window(&comp, popup, &surface.obj, &buffer);
+    f.run();
+    let id = f.check_new_surface();
+    assert!(matches!(
+        f.testwl.get_surface_data(id).unwrap().role,
+        Some(testwl::SurfaceRole::Toplevel(_))
+    ));
+}
+
+#[test]
+fn popup_uses_unique_group_parent_before_other_application_hover() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+    let parent = Window::new(1);
+    let (_, parent_id) = f.create_toplevel(&comp, parent);
+    let group = Window::new(99);
+    let entity = f.satellite.windows[&parent];
+    f.satellite
+        .world
+        .get::<&mut super::WindowData>(entity)
+        .unwrap()
+        .attrs
+        .group = Some(group);
+    let other = Window::new(2);
+    let (_, other_id) = f.create_toplevel(&comp, other);
+    f.testwl.move_pointer_to(other_id, 1.0, 1.0);
+    f.run();
+    let popup = Window::new(3);
+    let (buffer, surface) = comp.create_surface();
+    f.new_window(
+        popup,
+        true,
+        WindowData {
+            mapped: true,
+            dims: WindowDims {
+                x: 104,
+                y: 0,
+                width: 54,
+                height: 506,
+            },
+            ..Default::default()
+        },
+    );
+    let entity = f.satellite.windows[&popup];
+    f.satellite
+        .world
+        .get::<&mut super::WindowData>(entity)
+        .unwrap()
+        .attrs
+        .group = Some(group);
+    f.map_window(&comp, popup, &surface.obj, &buffer);
+    f.run();
+    let popup_id = f.check_new_surface();
+    let data = f.testwl.get_surface_data(popup_id).unwrap();
+    assert_eq!(
+        data.popup().parent.id(),
+        f.testwl
+            .get_surface_data(parent_id)
+            .unwrap()
+            .xdg()
+            .surface
+            .id()
+    );
+}
+
+#[test]
+fn popup_reposition_is_relative_to_the_selected_parent() {
+    for scale in [1, 2] {
+        let (mut f, comp) = TestFixture::new_with_compositor();
+        let (_, output) = f.new_output(500, 720);
+        output.scale(scale);
+        output.done();
+        f.run();
+        f.run();
+        let root = Window::new(1);
+        let (_, root_id) = f.create_toplevel(&comp, root);
+        f.testwl.move_surface_to_output(root_id, &output);
+        f.run();
+        let parent = Window::new(2);
+        let (_, parent_id) = f.create_popup(
+            &comp,
+            PopupBuilder::new(parent, root, root_id)
+                .transient_for(root)
+                .x(540)
+                .y(760)
+                .scale(scale),
+        );
+        f.testwl.move_surface_to_output(parent_id, &output);
+        f.run();
+        let pd = f.connection().windows[&parent].dims;
+        let popup = Window::new(3);
+        let (_, popup_id) = f.create_popup(
+            &comp,
+            PopupBuilder::new(popup, parent, parent_id)
+                .transient_for(parent)
+                .x(pd.x + 20 * scale as i16)
+                .y(pd.y + 10 * scale as i16)
+                .scale(scale),
+        );
+        let new_dims = WindowDims {
+            x: pd.x + 30 * scale as i16,
+            y: pd.y + 15 * scale as i16,
+            width: 50,
+            height: 50,
+        };
+        f.reconfigure_window(popup, new_dims, true);
+        f.run();
+        f.run();
+        let data = f.testwl.get_surface_data(popup_id).unwrap();
+        assert_eq!(
+            data.popup().positioner_state.offset,
+            testwl::Vec2 { x: 30, y: 15 }
+        );
+    }
+}
+
+#[test]
+fn popup_group_fallback_is_unambiguous_and_keeps_explicit_priority() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+    let group = Window::new(99);
+    let a = Window::new(1);
+    let b = Window::new(2);
+    for window in [a, b] {
+        f.create_toplevel(&comp, window);
+        let entity = f.satellite.windows[&window];
+        f.satellite
+            .world
+            .get::<&mut super::WindowData>(entity)
+            .unwrap()
+            .attrs
+            .group = Some(group);
+    }
+    let other = Window::new(3);
+    let (_, other_id) = f.create_toplevel(&comp, other);
+    f.testwl.move_pointer_to(other_id, 1.0, 1.0);
+    f.run();
+    let popup = Window::new(4);
+    f.new_window(popup, true, WindowData::default());
+    let entity = f.satellite.windows[&popup];
+    f.satellite
+        .world
+        .get::<&mut super::WindowData>(entity)
+        .unwrap()
+        .attrs
+        .group = Some(group);
+    assert_eq!(f.satellite.popup_parent(popup, None), Some(other));
+    assert_eq!(f.satellite.popup_parent(popup, Some(a)), Some(a));
+    f.satellite.unmap_window(b);
+    f.run();
+    assert_eq!(f.satellite.popup_parent(popup, None), Some(a));
+    assert_eq!(f.satellite.popup_parent(popup, Some(other)), Some(other));
 }
