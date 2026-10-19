@@ -9,7 +9,10 @@ use server::selection::{Clipboard, Primary};
 use smithay_client_toolkit::data_device_manager::WritePipe;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::{net::UnixStream, process::ExitStatusExt};
+use std::os::unix::{
+    net::UnixStream,
+    process::{CommandExt, ExitStatusExt},
+};
 use std::process::{Command, ExitStatus, Stdio};
 use wayland_server::{Display, ListeningSocket};
 use xcb::x;
@@ -19,8 +22,10 @@ pub trait XConnection: Sized + 'static {
 
     fn set_window_dims(&mut self, window: x::Window, dims: PendingSurfaceState) -> bool;
     fn set_fullscreen(&mut self, window: x::Window, fullscreen: bool);
+    fn set_maximized(&mut self, window: x::Window, maximized: bool);
     fn focus_window(&mut self, window: x::Window, output_name: Option<String>);
     fn send_take_focus(&mut self, window: x::Window);
+    fn focus_popup(&mut self, window: x::Window);
     fn close_window(&mut self, window: x::Window);
     fn unmap_window(&mut self, window: x::Window);
     fn raise_to_top(&mut self, window: x::Window);
@@ -40,6 +45,9 @@ pub trait RunData {
     fn flags(&self) -> &[String] {
         &[]
     }
+    fn compositor_scaling(&self) -> bool {
+        false
+    }
     fn server(&self) -> Option<UnixStream> {
         None
     }
@@ -52,6 +60,25 @@ pub trait RunData {
     fn max_req_len_bytes(&self) -> Option<usize> {
         None
     }
+}
+
+/// Guards the process environment while satellite calls into C libraries that
+/// read it with `getenv` (libwayland when creating its display and connection,
+/// xcb-util-cursor when loading the cursor theme).
+///
+/// Rust's own `std::env` functions are serialized by the standard library, but
+/// `getenv` in C is not, and it races with a concurrent `setenv`. When satellite
+/// runs inside another process (a compositor embedding it on a thread), that
+/// process should hold `ENV_LOCK.write()` whenever it changes its environment;
+/// satellite holds a read guard around each of those C calls. None of them
+/// wait on the embedding process, so a writer is only ever briefly delayed.
+pub static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// A read guard on [`ENV_LOCK`] (a poisoned lock is still usable here).
+pub(crate) fn env_read_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+    ENV_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub const fn timespec_from_millis(millis: u64) -> Timespec {
@@ -74,7 +101,10 @@ pub fn main(mut data: impl RunData) -> Option<()> {
     info!("Starting xwayland-satellite version {}", version());
 
     let socket = ListeningSocket::bind_auto("xwls", 1..=128).unwrap();
-    let mut display = Display::new().unwrap();
+    let mut display = {
+        let _env = env_read_guard();
+        Display::new().unwrap()
+    };
     let dh = display.handle();
     data.created_server();
 
@@ -92,6 +122,18 @@ pub fn main(mut data: impl RunData) -> Option<()> {
     let fds = data.listenfds();
     for fd in &fds {
         xwayland.args(["-listenfd", &fd.as_raw_fd().to_string()]);
+    }
+    // Let Xwayland inherit the listening sockets. This is done in the child,
+    // after fork, so an embedding process never has them inheritable by the
+    // other programs it spawns.
+    let listen_raw: Vec<i32> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
+    unsafe {
+        xwayland.pre_exec(move || {
+            for fd in &listen_raw {
+                rustix::io::fcntl_setfd(BorrowedFd::borrow_raw(*fd), rustix::io::FdFlags::empty())?;
+            }
+            Ok(())
+        });
     }
 
     let mut xwayland = xwayland
@@ -156,7 +198,8 @@ pub fn main(mut data: impl RunData) -> Option<()> {
         }
     };
 
-    let mut server_state = EarlyServerState::new(dh, data.server(), connection);
+    let mut server_state =
+        EarlyServerState::new(dh, data.server(), connection, data.compositor_scaling());
     server_state.run();
 
     // Remove the lifetimes on our fds to avoid borrowing issues, since we know they will exist for
@@ -227,6 +270,10 @@ pub fn main(mut data: impl RunData) -> Option<()> {
 
     loop {
         xstate.handle_events(&mut server_state);
+        if xstate.connection_lost() {
+            info!("Connection to Xwayland lost, stopping");
+            return None;
+        }
 
         display.dispatch_clients(&mut *server_state).unwrap();
         server_state.run();
@@ -244,17 +291,52 @@ pub fn main(mut data: impl RunData) -> Option<()> {
             xstate.update_global_scale(scale);
         }
 
-        match poll(&mut fds, None) {
-            Ok(_) => {
-                if !fds[3].revents().is_empty() {
-                    let status = xwayland_exit_code(&mut quit_rx);
-                    if status != ExitStatus::default() {
-                        error!("Xwayland exited early with {status}");
-                    }
-                    return None;
-                }
+        // Anything above that waited for an X11 reply (the XConnection calls made while
+        // dispatching, ConvertSelection in the paste path, selection ownership, XSETTINGS) may
+        // have pulled events into xcb's queue. Those never make the socket readable, so handle
+        // them now and go round again to dispatch the Wayland side instead of sleeping in poll.
+        if xstate.handle_queued_events(&mut server_state) {
+            continue;
+        }
+        let timeout = xstate.poll_timeout();
+        let is_quit = if !xstate.has_pending_transfers() {
+            let mut poll_fds = [
+                PollFd::from_borrowed_fd(server_fd, PollFlags::IN),
+                PollFd::new(&xsock_wl, PollFlags::IN),
+                PollFd::from_borrowed_fd(display_fd, PollFlags::IN),
+                PollFd::new(&quit_rx, PollFlags::IN),
+                PollFd::new(&ready_rx, PollFlags::IN),
+            ];
+            match poll(&mut poll_fds, timeout.as_ref()) {
+                Ok(_) => !poll_fds[3].revents().is_empty(),
+                Err(other) => panic!("Poll failed: {other:?}"),
             }
-            Err(other) => panic!("Poll failed: {other:?}"),
+        } else {
+            let mut poll_fds = vec![
+                PollFd::from_borrowed_fd(server_fd, PollFlags::IN),
+                PollFd::new(&xsock_wl, PollFlags::IN),
+                PollFd::from_borrowed_fd(display_fd, PollFlags::IN),
+                PollFd::new(&quit_rx, PollFlags::IN),
+                PollFd::new(&ready_rx, PollFlags::IN),
+            ];
+            xstate.collect_poll_fds(&mut poll_fds);
+            match poll(&mut poll_fds, timeout.as_ref()) {
+                Ok(_) => {
+                    let is_quit = !poll_fds[3].revents().is_empty();
+                    let events: Vec<_> = poll_fds.iter().map(|f| f.revents()).collect();
+                    xstate.process_pending_clipboard_transfers(&events);
+                    is_quit
+                }
+                Err(other) => panic!("Poll failed: {other:?}"),
+            }
+        };
+
+        if is_quit {
+            let status = xwayland_exit_code(&mut quit_rx);
+            if status != ExitStatus::default() {
+                error!("Xwayland exited early with {status}");
+            }
+            return None;
         }
     }
 }
