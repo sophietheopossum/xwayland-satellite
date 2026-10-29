@@ -3792,55 +3792,53 @@ fn test_monitor_disconnect_scaling_fallback() {
     for (e, next_out) in surfaces_to_update {
         if next_out == hecs::Entity::DANGLING {
             let _ = world.remove_one::<OnOutput>(e);
-        } else {
-            if let Ok(scale) = world.get::<&SurfaceScaleFactor>(e) {
-                let scale_val = scale.0;
+        } else if let Ok(scale) = world.get::<&SurfaceScaleFactor>(e) {
+            let scale_val = scale.0;
 
-                let mut query = world
-                    .query_one::<(&Window, &mut super::WindowData)>(e)
-                    .unwrap();
-                if let Some((window, win_data)) = query.get() {
-                    if let Ok(dimensions) = world.get::<&OutputDimensions>(next_out) {
-                        let (ox, oy) = if let Ok(pos) = world.get::<&X11OutputPosition>(next_out) {
-                            (pos.x, pos.y)
-                        } else {
-                            (dimensions.x, dimensions.y)
-                        };
-                        let mut conn = FakeXConnection::default();
-                        conn.windows.insert(
-                            *window,
-                            WindowData {
-                                mapped: true,
-                                fullscreen: false,
-                                maximized: false,
-                                dims: WindowDims {
-                                    x: 1500,
-                                    y: 100,
-                                    width: 200,
-                                    height: 200,
-                                },
+            let mut query = world
+                .query_one::<(&Window, &mut super::WindowData)>(e)
+                .unwrap();
+            if let Some((window, win_data)) = query.get() {
+                if let Ok(dimensions) = world.get::<&OutputDimensions>(next_out) {
+                    let (ox, oy) = if let Ok(pos) = world.get::<&X11OutputPosition>(next_out) {
+                        (pos.x, pos.y)
+                    } else {
+                        (dimensions.x, dimensions.y)
+                    };
+                    let mut conn = FakeXConnection::default();
+                    conn.windows.insert(
+                        *window,
+                        WindowData {
+                            mapped: true,
+                            fullscreen: false,
+                            maximized: false,
+                            dims: WindowDims {
+                                x: 1500,
+                                y: 100,
+                                width: 200,
+                                height: 200,
                             },
-                        );
-                        win_data.update_output_offset(
-                            *window,
-                            WindowOutputOffset { x: ox, y: oy },
-                            &mut conn,
-                        );
-                    }
+                        },
+                    );
+                    win_data.update_output_offset(
+                        *window,
+                        WindowOutputOffset { x: ox, y: oy },
+                        &mut conn,
+                    );
                 }
-                drop(query);
+            }
+            drop(query);
 
-                if let Ok(out_query) = world
-                    .query_one::<(&mut OutputScaleFactor, &mut TrueOutputScaleFactor)>(next_out)
-                {
-                    if update_output_scale(
-                        out_query,
-                        OutputScaleFactor::Fractional(scale_val),
-                        false,
-                        1.0,
-                    ) {
-                        updated_outputs.push(next_out);
-                    }
+            if let Ok(out_query) =
+                world.query_one::<(&mut OutputScaleFactor, &mut TrueOutputScaleFactor)>(next_out)
+            {
+                if update_output_scale(
+                    out_query,
+                    OutputScaleFactor::Fractional(scale_val),
+                    false,
+                    1.0,
+                ) {
+                    updated_outputs.push(next_out);
                 }
             }
         }
