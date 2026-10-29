@@ -13,6 +13,10 @@ use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1;
 use wayland_protocols::{
     wp::{
+        cursor_shape::v1::server::{
+            wp_cursor_shape_device_v1::{self, WpCursorShapeDeviceV1},
+            wp_cursor_shape_manager_v1::{self, WpCursorShapeManagerV1},
+        },
         fractional_scale::v1::server::{
             wp_fractional_scale_manager_v1::{self, WpFractionalScaleManagerV1},
             wp_fractional_scale_v1::{self, WpFractionalScaleV1},
@@ -80,6 +84,7 @@ use wayland_server::{
         wl_keyboard::{self, WlKeyboard},
         wl_output::{self, WlOutput},
         wl_pointer::{self, WlPointer},
+        wl_region::WlRegion,
         wl_seat::{self, WlSeat},
         wl_shm::WlShm,
         wl_shm_pool::WlShmPool,
@@ -116,6 +121,15 @@ pub struct SurfaceData {
     pub viewport: Option<Viewport>,
     pub moving: bool,
     pub resizing: Option<xdg_toplevel::ResizeEdge>,
+    pub minimized: bool,
+    /// Outputs the surface has been sent wl_surface.enter for.
+    pub entered: Vec<WlOutput>,
+    pub input_region: Option<Vec<(i32, i32, i32, i32)>>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RegionState {
+    pub rects: Vec<(i32, i32, i32, i32)>,
 }
 
 impl SurfaceData {
@@ -256,6 +270,17 @@ pub struct LockedPointer {
 struct PointerState {
     pointer: WlPointer,
     locked: Option<LockedPointer>,
+    cursor_hotspot: Option<(i32, i32)>,
+    cursor: Option<PointerCursorRequest>,
+}
+
+/// The last cursor request for the pointer, from either `wl_pointer.set_cursor`
+/// or `wp_cursor_shape_device_v1.set_shape`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PointerCursorRequest {
+    Hidden,
+    Surface(SurfaceId),
+    Shape(wp_cursor_shape_device_v1::Shape),
 }
 
 struct State {
@@ -663,6 +688,24 @@ impl Server {
         self.state.pointer.as_ref().map(|p| &p.pointer).unwrap()
     }
 
+    /// The last cursor request for the pointer.
+    #[track_caller]
+    pub fn pointer_cursor(&self) -> Option<PointerCursorRequest> {
+        self.state.pointer.as_ref().unwrap().cursor.clone()
+    }
+
+    pub fn enable_cursor_shape(&mut self) {
+        self.dh
+            .create_global::<State, WpCursorShapeManagerV1, _>(1, ());
+        self.display.flush_clients().unwrap();
+    }
+
+    /// Hotspot of the last `wl_pointer.set_cursor` request.
+    #[track_caller]
+    pub fn cursor_hotspot(&self) -> Option<(i32, i32)> {
+        self.state.pointer.as_ref().unwrap().cursor_hotspot
+    }
+
     #[track_caller]
     pub fn locked_pointer(&self) -> Option<&LockedPointer> {
         self.state.pointer.as_ref().unwrap().locked.as_ref()
@@ -896,8 +939,49 @@ impl Server {
     }
 
     pub fn move_surface_to_output(&mut self, surface: SurfaceId, output: &WlOutput) {
-        let data = self.state.surfaces.get(&surface).expect("No such surface");
+        let data = self
+            .state
+            .surfaces
+            .get_mut(&surface)
+            .expect("No such surface");
+        // Real compositors send wl_surface.leave for outputs a moved surface
+        // is no longer on; model that so output-anchoring logic in the
+        // client under test behaves as it would in production.
+        let previously_entered = std::mem::take(&mut data.entered);
+        // Leave every output except the target.
+        for old in &previously_entered {
+            if old.id() != output.id() {
+                data.surface.leave(old);
+            }
+        }
+        // Enter the target, unless the surface was already on it. This is
+        // independent of the leaves above: a surface moving off one output
+        // still gets an enter for the one it is moving to.
+        if !previously_entered.iter().any(|o| o.id() == output.id()) {
+            data.surface.enter(output);
+        }
+        data.entered.push(output.clone());
+        self.display.flush_clients().unwrap();
+    }
+
+    /// Send `wl_surface.enter` for an additional output, leaving the surface
+    /// on every output it is already on.
+    ///
+    /// This models a surface straddling two outputs - a window overlapping a
+    /// boundary, or a bounding box sweeping across one during an animation.
+    /// [`Self::move_surface_to_output`] cannot express it, because it leaves
+    /// every other output by design.
+    pub fn add_surface_to_output(&mut self, surface: SurfaceId, output: &WlOutput) {
+        let data = self
+            .state
+            .surfaces
+            .get_mut(&surface)
+            .expect("No such surface");
+        if data.entered.iter().any(|o| o.id() == output.id()) {
+            return;
+        }
         data.surface.enter(output);
+        data.entered.push(output.clone());
         self.display.flush_clients().unwrap();
     }
 
@@ -1423,6 +1507,8 @@ impl Dispatch<WlSeat, ()> for State {
                 state.pointer = Some(PointerState {
                     pointer: data_init.init(id, ()),
                     locked: None,
+                    cursor_hotspot: None,
+                    cursor: None,
                 });
             }
             wl_seat::Request::GetKeyboard { id } => {
@@ -1451,7 +1537,19 @@ impl Dispatch<WlPointer, ()> for State {
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
         match request {
-            wl_pointer::Request::SetCursor { surface, .. } => {
+            wl_pointer::Request::SetCursor {
+                surface,
+                hotspot_x,
+                hotspot_y,
+                ..
+            } => {
+                if let Some(pointer) = state.pointer.as_mut() {
+                    pointer.cursor_hotspot = Some((hotspot_x, hotspot_y));
+                    pointer.cursor = Some(match &surface {
+                        Some(surface) => PointerCursorRequest::Surface(SurfaceId::from(surface)),
+                        None => PointerCursorRequest::Hidden,
+                    });
+                }
                 if let Some(surface) = surface {
                     let data = state.surfaces.get_mut(&SurfaceId::from(&surface)).unwrap();
 
@@ -1578,7 +1676,9 @@ impl Dispatch<XdgToplevel, SurfaceId> for State {
                 let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
                     unreachable!();
                 };
-                toplevel.states.push(xdg_toplevel::State::Fullscreen);
+                if !toplevel.states.contains(&xdg_toplevel::State::Fullscreen) {
+                    toplevel.states.push(xdg_toplevel::State::Fullscreen);
+                }
                 let states = toplevel.states.clone();
                 state.configure_toplevel(*surface_id, 100, 100, states);
             }
@@ -1598,6 +1698,39 @@ impl Dispatch<XdgToplevel, SurfaceId> for State {
                 toplevel.states.swap_remove(pos);
                 let states = toplevel.states.clone();
                 state.configure_toplevel(*surface_id, 100, 100, states);
+            }
+            xdg_toplevel::Request::SetMaximized => {
+                let data = state.surfaces.get_mut(surface_id).unwrap();
+                let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
+                    unreachable!();
+                };
+                if toplevel.states.contains(&xdg_toplevel::State::Maximized) {
+                    return;
+                }
+                toplevel.states.push(xdg_toplevel::State::Maximized);
+                let states = toplevel.states.clone();
+                state.configure_toplevel(*surface_id, 100, 100, states);
+            }
+            xdg_toplevel::Request::UnsetMaximized => {
+                let data = state.surfaces.get_mut(surface_id).unwrap();
+                let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
+                    unreachable!();
+                };
+                let Some(pos) = toplevel
+                    .states
+                    .iter()
+                    .copied()
+                    .position(|p| p == xdg_toplevel::State::Maximized)
+                else {
+                    return;
+                };
+                toplevel.states.swap_remove(pos);
+                let states = toplevel.states.clone();
+                state.configure_toplevel(*surface_id, 100, 100, states);
+            }
+            xdg_toplevel::Request::SetMinimized => {
+                let data = state.surfaces.get_mut(surface_id).unwrap();
+                data.minimized = true;
             }
             xdg_toplevel::Request::Destroy => {}
             xdg_toplevel::Request::SetTitle { title } => {
@@ -1969,10 +2102,16 @@ impl Dispatch<WlCompositor, ()> for State {
                         viewport: None,
                         moving: false,
                         resizing: None,
+                        minimized: false,
+                        entered: Vec::new(),
+                        input_region: None,
                     },
                 );
                 state.last_surface_id = Some(SurfaceId(id));
                 state.created_surfaces.push(SurfaceId(id));
+            }
+            proto::wl_compositor::Request::CreateRegion { id } => {
+                data_init.init(id, Arc::new(Mutex::new(RegionState::default())));
             }
             _ => unreachable!(),
         }
@@ -2062,9 +2201,40 @@ impl Dispatch<WlSurface, ()> for State {
                 }
                 state.surfaces.remove(&id);
             }
-            SetInputRegion { .. } => {}
+            SetInputRegion { region } => {
+                data.input_region = region.map(|r| {
+                    let r_data = r.data::<Arc<Mutex<RegionState>>>().unwrap();
+                    r_data.lock().unwrap().rects.clone()
+                });
+            }
             SetBufferScale { .. } => {}
             other => todo!("unhandled request {other:?}"),
+        }
+    }
+}
+
+impl Dispatch<WlRegion, Arc<Mutex<RegionState>>> for State {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &WlRegion,
+        request: <WlRegion as Resource>::Request,
+        data: &Arc<Mutex<RegionState>>,
+        _: &DisplayHandle,
+        _: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            proto::wl_region::Request::Add {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                data.lock().unwrap().rects.push((x, y, width, height));
+            }
+            proto::wl_region::Request::Subtract { .. } => {}
+            proto::wl_region::Request::Destroy => {}
+            _ => {}
         }
     }
 }
@@ -2400,6 +2570,54 @@ impl Dispatch<WpViewport, SurfaceId> for State {
                 }
             }
             _ => unimplemented!("{request:?}"),
+        }
+    }
+}
+
+simple_global_dispatch!(WpCursorShapeManagerV1);
+
+impl Dispatch<WpCursorShapeManagerV1, ()> for State {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &WpCursorShapeManagerV1,
+        request: <WpCursorShapeManagerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            wp_cursor_shape_manager_v1::Request::GetPointer {
+                cursor_shape_device,
+                ..
+            } => {
+                data_init.init(cursor_shape_device, ());
+            }
+            wp_cursor_shape_manager_v1::Request::Destroy => {}
+            other => todo!("unhandled cursor shape manager request: {other:?}"),
+        }
+    }
+}
+
+impl Dispatch<WpCursorShapeDeviceV1, ()> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WpCursorShapeDeviceV1,
+        request: <WpCursorShapeDeviceV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            wp_cursor_shape_device_v1::Request::SetShape { shape, .. } => {
+                let shape = shape.into_result().expect("invalid cursor shape");
+                if let Some(pointer) = state.pointer.as_mut() {
+                    pointer.cursor = Some(PointerCursorRequest::Shape(shape));
+                }
+            }
+            wp_cursor_shape_device_v1::Request::Destroy => {}
+            other => todo!("unhandled cursor shape device request: {other:?}"),
         }
     }
 }

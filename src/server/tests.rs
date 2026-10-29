@@ -19,6 +19,7 @@ use wayland_client::{
         wl_keyboard::WlKeyboard,
         wl_output::{self, WlOutput},
         wl_pointer::WlPointer,
+        wl_region::WlRegion,
         wl_registry::WlRegistry,
         wl_seat::{self, WlSeat},
         wl_shm::{Format, WlShm},
@@ -149,12 +150,82 @@ impl Compositor {
 
         (buffer, surface)
     }
+
+    fn create_region(&self) -> TestObject<WlRegion> {
+        TestObject::<WlRegion>::from_request(
+            &self.compositor.obj,
+            Req::<WlCompositor>::CreateRegion {},
+        )
+    }
+}
+
+impl Compositor {
+    /// A new surface set as the cursor of `pointer`; see [`Self::set_cursor_on`].
+    fn set_cursor(
+        &self,
+        pointer: &TestObject<WlPointer>,
+        width: i32,
+        height: i32,
+        hotspot: (i32, i32),
+    ) -> TestObject<WlSurface> {
+        let surface = TestObject::<WlSurface>::from_request(
+            &self.compositor.obj,
+            Req::<WlCompositor>::CreateSurface {},
+        );
+        self.set_cursor_on(pointer, &surface, width, height, hotspot);
+        surface
+    }
+
+    /// Set `surface` as the cursor of `pointer` with the given hotspot (in X
+    /// pixels), then attach a `width`x`height` shm buffer and commit, in the
+    /// order Xwayland sends these requests.
+    fn set_cursor_on(
+        &self,
+        pointer: &TestObject<WlPointer>,
+        surface: &TestObject<WlSurface>,
+        width: i32,
+        height: i32,
+        hotspot: (i32, i32),
+    ) {
+        let fd = unsafe { BorrowedFd::borrow_raw(0) };
+        let pool = TestObject::<WlShmPool>::from_request(
+            &self.shm.obj,
+            Req::<WlShm>::CreatePool { fd, size: 1024 },
+        );
+        let buffer = TestObject::<WlBuffer>::from_request(
+            &pool.obj,
+            Req::<WlShmPool>::CreateBuffer {
+                offset: 0,
+                width,
+                height,
+                stride: 1,
+                format: WEnum::Value(Format::Argb8888),
+            },
+        );
+        pointer
+            .send_request(Req::<WlPointer>::SetCursor {
+                serial: 0,
+                surface: Some(surface.obj.clone()),
+                hotspot_x: hotspot.0,
+                hotspot_y: hotspot.1,
+            })
+            .unwrap();
+        surface
+            .send_request(Req::<WlSurface>::Attach {
+                buffer: Some(buffer.obj.clone()),
+                x: 0,
+                y: 0,
+            })
+            .unwrap();
+        surface.send_request(Req::<WlSurface>::Commit).unwrap();
+    }
 }
 
 #[derive(Debug, Default)]
 struct WindowData {
     mapped: bool,
     fullscreen: bool,
+    maximized: bool,
     dims: WindowDims,
 }
 #[derive(Default)]
@@ -215,6 +286,11 @@ impl super::XConnection for FakeXConnection {
     }
 
     #[track_caller]
+    fn set_maximized(&mut self, window: xcb::x::Window, maximized: bool) {
+        self.window_mut(window).maximized = maximized;
+    }
+
+    #[track_caller]
     fn set_window_dims(&mut self, window: Window, state: super::PendingSurfaceState) -> bool {
         self.window_mut(window).dims = WindowDims {
             x: state.x as _,
@@ -242,6 +318,15 @@ impl super::XConnection for FakeXConnection {
             "Unknown window: {window:?}"
         );
         self.send_take_focus_window = window.into();
+    }
+
+    #[track_caller]
+    fn focus_popup(&mut self, window: Window) {
+        assert!(
+            self.windows.contains_key(&window),
+            "Unknown window: {window:?}"
+        );
+        self.focused_window = window.into();
     }
 
     fn raise_to_top(&mut self, window: Window) {
@@ -384,7 +469,7 @@ impl EarlyTestFixture {
         });
 
         let (fake_client, xwls_server) = UnixStream::pair().unwrap();
-        let satellite = ServerState::new(display.handle(), Some(client_s), xwls_server);
+        let satellite = ServerState::new(display.handle(), Some(client_s), xwls_server, false);
         let testwl = thread.join().unwrap();
 
         let xwls_connection = Connection::from_socket(fake_client).unwrap();
@@ -593,7 +678,11 @@ impl TestFixture<FakeXConnection> {
     }
 
     fn enable_xdg_output(&mut self) -> TestObject<ZxdgOutputManagerV1> {
-        self.testwl.enable_xdg_output_manager();
+        self.enable_xdg_output_version(3)
+    }
+
+    fn enable_xdg_output_version(&mut self, version: u32) -> TestObject<ZxdgOutputManagerV1> {
+        self.testwl.enable_xdg_output_manager_version(version);
         self.run();
         self.run();
 
@@ -641,6 +730,32 @@ impl TestFixture<FakeXConnection> {
 
     fn register_window(&mut self, window: Window, data: WindowData) {
         self.satellite.connection.windows.insert(window, data);
+    }
+
+    fn new_fractional_output(
+        &mut self,
+        manager: &TestObject<ZxdgOutputManagerV1>,
+        x: i32,
+        scale: f64,
+    ) -> s_proto::wl_output::WlOutput {
+        let (client, output) = self.new_output(x, 0);
+        self.create_xdg_output(manager, client.obj);
+        let physical = (1000.0 * scale) as i32;
+        output.mode(
+            s_proto::wl_output::Mode::Current,
+            physical,
+            physical,
+            144000,
+        );
+        output.scale(scale.ceil() as i32);
+        self.testwl
+            .get_xdg_output(&output)
+            .unwrap()
+            .logical_size(1000, 1000);
+        output.done();
+        self.run();
+        self.run();
+        output
     }
 
     fn new_window(&mut self, window: Window, override_redirect: bool, data: WindowData) {
@@ -717,6 +832,7 @@ impl TestFixture<FakeXConnection> {
                 height: 50,
             },
             fullscreen: false,
+            maximized: false,
         };
 
         self.new_window(window, false, data);
@@ -751,7 +867,7 @@ impl TestFixture<FakeXConnection> {
             assert!(surface_data.buffer.is_some());
         }
 
-        let scale = self.satellite.current_scale;
+        let scale = self.satellite.global_scale;
         let expected_width = (100.0 * scale) as u16;
         let expected_height = (100.0 * scale) as u16;
 
@@ -792,6 +908,7 @@ impl TestFixture<FakeXConnection> {
             mapped: true,
             dims,
             fullscreen: false,
+            maximized: false,
         };
         self.new_window(window, true, data);
         self.map_window(comp, window, &surface.obj, &buffer);
@@ -829,8 +946,8 @@ impl TestFixture<FakeXConnection> {
                 assert_eq!(
                     pos.size.as_ref().unwrap(),
                     &testwl::Vec2 {
-                        x: (dims.width as f64 / scale).ceil() as i32,
-                        y: (dims.height as f64 / scale).ceil() as i32
+                        x: (dims.width as f64 / scale).round() as i32,
+                        y: (dims.height as f64 / scale).round() as i32
                     }
                 );
 
@@ -839,8 +956,8 @@ impl TestFixture<FakeXConnection> {
                     pos.anchor_rect.as_ref().unwrap(),
                     &testwl::Rect {
                         size: testwl::Vec2 {
-                            x: (parent_win.dims.width as f64 / scale).ceil() as i32,
-                            y: (parent_win.dims.height as f64 / scale).ceil() as i32
+                            x: 1.max((parent_win.dims.width as f64 / scale).round() as i32),
+                            y: 1.max((parent_win.dims.height as f64 / scale).round() as i32)
                         },
                         offset: testwl::Vec2::default()
                     }
@@ -890,6 +1007,7 @@ impl TestFixture<FakeXConnection> {
                 height: 50,
             },
             fullscreen: false,
+            maximized: false,
         };
         self.new_window(win_popup, override_redirect, data);
         if !override_redirect {
@@ -961,6 +1079,7 @@ impl TestFixture<FakeXConnection> {
     }
 
     fn reconfigure_window(&mut self, window: Window, dims: WindowDims, override_redirect: bool) {
+        self.satellite.connection.window_mut(window).dims = dims;
         self.satellite
             .reconfigure_window(x::ConfigureNotifyEvent::new(
                 window,
@@ -1335,6 +1454,61 @@ fn fullscreen() {
 }
 
 #[test]
+fn maximized() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+
+    let mut check = |state, expected| {
+        f.satellite.set_maximized(win, state);
+        f.run();
+        f.run();
+
+        let data = f.testwl.get_surface_data(id).unwrap();
+        assert_eq!(
+            data.toplevel()
+                .states
+                .contains(&xdg_toplevel::State::Maximized),
+            expected
+        );
+        // The state has to make it back to the X11 window, or the client will keep
+        // drawing itself (and its titlebar buttons) as if it were unmaximized.
+        assert_eq!(f.satellite.connection.window(win).maximized, expected);
+    };
+
+    check(SetState::Add, true);
+    check(SetState::Remove, false);
+    check(SetState::Toggle, true);
+    check(SetState::Toggle, false);
+
+    f.testwl
+        .configure_toplevel(id, 800, 600, vec![xdg_toplevel::State::Maximized]);
+    f.run();
+    f.run();
+    assert!(f.satellite.connection.windows[&win].maximized);
+
+    f.testwl.configure_toplevel(id, 800, 600, vec![]);
+    f.run();
+    f.run();
+    assert!(!f.satellite.connection.windows[&win].maximized);
+}
+
+#[test]
+fn minimized() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+
+    assert!(!f.testwl.get_surface_data(id).unwrap().minimized);
+
+    f.satellite.minimize_window(win);
+    f.run();
+    f.run();
+
+    assert!(f.testwl.get_surface_data(id).unwrap().minimized);
+}
+
+#[test]
 fn window_title_and_class() {
     let (mut f, comp) = TestFixture::new_with_compositor();
     let win = Window::new(1);
@@ -1391,6 +1565,7 @@ fn window_group_properties() {
             ..Default::default()
         },
         fullscreen: false,
+        maximized: false,
     };
 
     let (_, surface) = comp.create_surface();
@@ -1430,6 +1605,7 @@ fn splash_window_fixed_size() {
         mapped: false,
         dims,
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(splash, false, data);
     f.satellite
@@ -2169,6 +2345,7 @@ fn reconfigure_popup_after_map() {
         mapped: true,
         dims: old_dims,
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(popup, true, popup_data);
     f.satellite.map_window(popup);
@@ -2397,6 +2574,7 @@ fn fullscreen_heuristic() {
                 height: 1000,
             },
             fullscreen: false,
+            maximized: false,
         };
         f.new_window(window, override_redirect, data);
         f.map_window(&comp, window, &surface.obj, &buffer);
@@ -2612,7 +2790,7 @@ fn fractional_scale_small_popup() {
         .get_surface_data(popup_id)
         .expect("Missing popup data");
     let pos = &data.popup().positioner_state;
-    assert_eq!(pos.size.unwrap(), testwl::Vec2 { x: 2, y: 1 });
+    assert_eq!(pos.size.unwrap(), testwl::Vec2 { x: 1, y: 1 });
 }
 
 #[test]
@@ -2635,6 +2813,7 @@ fn toplevel_size_limits_scaled() {
             ..Default::default()
         },
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(window, false, data);
     f.satellite.set_size_hints(
@@ -2693,8 +2872,21 @@ fn toplevel_size_limits_scaled() {
 
     let data = f.testwl.get_surface_data(id).unwrap();
     let toplevel = data.toplevel();
-    assert_eq!(toplevel.min_size, Some(testwl::Vec2 { x: 20, y: 45 }));
-    assert_eq!(toplevel.max_size, Some(testwl::Vec2 { x: 100, y: 125 }));
+    let bar_h = super::decoration::DecorationsDataSatellite::calculate_titlebar_height();
+    assert_eq!(
+        toplevel.min_size,
+        Some(testwl::Vec2 {
+            x: 20,
+            y: 20 + bar_h
+        })
+    );
+    assert_eq!(
+        toplevel.max_size,
+        Some(testwl::Vec2 {
+            x: 100,
+            y: 100 + bar_h
+        })
+    );
 
     // Try unsetting size hints one after another
     f.satellite.set_size_hints(
@@ -2710,7 +2902,14 @@ fn toplevel_size_limits_scaled() {
     f.run();
     let data = f.testwl.get_surface_data(id).unwrap();
     let toplevel = data.toplevel();
-    assert_eq!(toplevel.min_size, Some(testwl::Vec2 { x: 20, y: 45 }));
+    let bar_h = super::decoration::DecorationsDataSatellite::calculate_titlebar_height();
+    assert_eq!(
+        toplevel.min_size,
+        Some(testwl::Vec2 {
+            x: 20,
+            y: 20 + bar_h
+        })
+    );
     assert_eq!(toplevel.max_size, None);
 
     f.satellite.set_size_hints(
@@ -2781,6 +2980,7 @@ fn transient_for_toplevel() {
                 ..Default::default()
             },
             fullscreen: false,
+            maximized: false,
         },
     );
 
@@ -2957,6 +3157,7 @@ fn quick_destroy_window_with_serial() {
             height: 50,
         },
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(window, false, data);
     f.satellite.map_window(window);
@@ -3044,8 +3245,9 @@ fn disconnected_output_rescaling() {
         testwl.enable_fractional_scale();
     });
     let comp = f.compositor();
-    let (_, output_main) = f.new_output(0, 0);
-    let (_, output_ext) = f.new_output(1000, 0);
+    let manager = f.enable_xdg_output();
+    let output_main = f.new_fractional_output(&manager, 0, 2.0);
+    let output_ext = f.new_fractional_output(&manager, 1000, 1.5);
 
     let window = Window::new(1);
     let (_, id) = f.create_toplevel(&comp, window);
@@ -3067,8 +3269,35 @@ fn disconnected_output_rescaling() {
     fractional.preferred_scale(180); // 1.5 scale
     f.testwl.move_surface_to_output(id, &output_ext);
     f.run();
-    // Multiple monitors with different scaling will select the lowest scale across monitors
+    // Mixed-DPI setups pick the lowest scale across monitors
     assert_eq!(f.satellite.inner.new_scale, Some(1.5));
+
+    // testwl does not auto-leave output on surface move
+    {
+        let surface_entity = f
+            .satellite
+            .world
+            .query::<&super::event::OnOutput>()
+            .iter()
+            .next()
+            .unwrap()
+            .0;
+        let output_main_entity = f
+            .satellite
+            .world
+            .query::<&super::event::OutputDimensions>()
+            .iter()
+            .find(|(_, dims)| dims.x == 0)
+            .unwrap()
+            .0;
+        if let Ok(mut entered) = f
+            .satellite
+            .world
+            .get::<&mut super::event::EnteredOutputs>(surface_entity)
+        {
+            entered.0.retain(|&e| e != output_main_entity);
+        }
+    }
 
     f.remove_output(output_ext);
     let surface_data = f.testwl.get_surface_data(id).expect("No surface data");
@@ -3079,8 +3308,9 @@ fn disconnected_output_rescaling() {
     fractional.preferred_scale(120); // 1.0 scale
     f.run();
     f.run();
-    // An fractional scale change done while the surface is on a removed output is ignored
-    assert_eq!(f.satellite.inner.new_scale, Some(1.5));
+    // Removing the output changes global DPI immediately, without relying on
+    // a surface entering the remaining monitor or announcing its scale.
+    assert_eq!(f.satellite.inner.new_scale, Some(2.0));
 
     f.testwl.move_surface_to_output(id, &output_main);
     let surface_data = f.testwl.get_surface_data(id).expect("No surface data");
@@ -3115,6 +3345,343 @@ fn check_window_and_viewport_size(
 }
 
 #[test]
+fn overlapping_surface_scale_does_not_change_global_output_dpi() {
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let comp = f.compositor();
+    let xdg = f.enable_xdg_output();
+    let (low_client, low) = f.new_output(0, 0);
+    let (high_client, high) = f.new_output(1000, 0);
+    f.create_xdg_output(&xdg, low_client.obj);
+    f.create_xdg_output(&xdg, high_client.obj);
+    for (output, physical, logical) in [(&low, 1000, 1000), (&high, 1500, 1000)] {
+        output.mode(
+            s_proto::wl_output::Mode::Current,
+            physical,
+            physical,
+            144000,
+        );
+        output.scale(if physical == logical { 1 } else { 2 });
+        f.testwl
+            .get_xdg_output(output)
+            .unwrap()
+            .logical_size(logical, logical);
+        output.done();
+    }
+    f.run();
+    let (_, low_id) = f.create_toplevel(&comp, Window::new(1));
+    let (_, high_id) = f.create_toplevel(&comp, Window::new(2));
+    for (id, output, scale) in [(low_id, &low, 120), (high_id, &high, 180)] {
+        f.testwl
+            .get_surface_data(id)
+            .unwrap()
+            .fractional
+            .as_ref()
+            .unwrap()
+            .preferred_scale(scale);
+        f.testwl.move_surface_to_output(id, output);
+        f.run();
+    }
+    assert_eq!(f.satellite.current_scale, 1.0);
+
+    // A straddling surface enters the low-DPI output while its preferred
+    // raster scale still belongs to the high-DPI output. Enter is not primary.
+    let high_surface = f.testwl.get_surface_data(high_id).unwrap().surface.clone();
+    high_surface.enter(&low);
+    f.run();
+    f.run();
+    assert_eq!(
+        f.satellite.current_scale, 1.0,
+        "enter must not overwrite output DPI"
+    );
+    for scale in [120, 180, 120, 180] {
+        f.testwl
+            .get_surface_data(high_id)
+            .unwrap()
+            .fractional
+            .as_ref()
+            .unwrap()
+            .preferred_scale(scale);
+        f.run();
+        f.run();
+        assert_eq!(
+            f.satellite.current_scale, 1.0,
+            "surface preference must not change global DPI"
+        );
+    }
+}
+
+#[test]
+fn fractional_output_dpi_waits_for_done_and_handles_rotation_and_rounding() {
+    let mut f = TestFixture::new_pre_connect(|testwl| testwl.enable_fractional_scale());
+    let _comp = f.compositor();
+    let manager = f.enable_xdg_output();
+    let output = f.new_fractional_output(&manager, 0, 1.5);
+    let xdg = f.testwl.get_xdg_output(&output).unwrap();
+    // xdg-output v3's deprecated done must not commit half of an output batch.
+    xdg.logical_size(2560, 1440);
+    xdg.done();
+    f.run();
+    f.run();
+    assert_eq!(f.satellite.current_scale, 1.5);
+    output.mode(s_proto::wl_output::Mode::Current, 3840, 2160, 144000);
+    output.done();
+    f.run();
+    f.run();
+    assert_eq!(f.satellite.current_scale, 1.5);
+
+    use s_proto::wl_output::{Mode, Subpixel, Transform};
+    for (transform, logical, expected) in [
+        (Transform::_90, (1440, 2560), 1.5),
+        (Transform::_270, (1440, 2560), 1.5),
+        (Transform::Flipped90, (1440, 2560), 1.5),
+        (Transform::Normal, (3072, 1728), 1.25),
+        (Transform::Normal, (2304, 1296), 200.0 / 120.0),
+        (Transform::Normal, (2194, 1234), 1.75),
+    ] {
+        output.geometry(
+            0,
+            0,
+            0,
+            0,
+            Subpixel::Unknown,
+            "test".into(),
+            "test".into(),
+            transform,
+        );
+        xdg.logical_size(logical.0, logical.1);
+        output.done();
+        f.run();
+        f.run();
+        assert_eq!(f.satellite.current_scale, expected);
+    }
+    // Changing the physical mode alone also changes the derived output scale.
+    xdg.logical_size(1920, 1080);
+    output.mode(Mode::Current, 3840, 2160, 60000);
+    output.done();
+    f.run();
+    f.run();
+    assert_eq!(f.satellite.current_scale, 2.0);
+    output.mode(Mode::Current, 1920, 1080, 60000);
+    output.done();
+    f.run();
+    f.run();
+    assert_eq!(f.satellite.current_scale, 1.0);
+}
+
+#[test]
+fn output_dpi_keeps_integer_fallback_without_fractional_scale() {
+    let mut f = TestFixture::new_pre_connect(|_| {});
+    let _comp = f.compositor();
+    let manager = f.enable_xdg_output();
+    f.new_fractional_output(&manager, 0, 1.5);
+    assert_eq!(f.satellite.current_scale, 2.0);
+}
+
+#[test]
+fn legacy_output_batches_keep_integer_dpi_and_follow_scale_changes() {
+    for version in [1, 2] {
+        let mut f = TestFixture::new_pre_connect(|testwl| testwl.enable_fractional_scale());
+        let _comp = f.compositor();
+        let manager = f.enable_xdg_output_version(version);
+        let (client, output) = f.new_output(0, 0);
+        f.create_xdg_output(&manager, client.obj);
+        let xdg = f.testwl.get_xdg_output(&output).unwrap();
+        output.mode(s_proto::wl_output::Mode::Current, 1500, 1500, 60000);
+        output.scale(2);
+        output.done();
+        f.run();
+        f.run();
+        xdg.logical_size(1000, 1000);
+        xdg.done();
+        f.run();
+        f.run();
+        assert_eq!(f.satellite.current_scale, 2.0);
+
+        // Legacy xdg.done cannot commit a coherent pair with wl_output.mode.
+        // Check the intermediate dispatch as well as the completed transition.
+        xdg.logical_size(2000, 2000);
+        xdg.done();
+        f.run();
+        f.run();
+        assert_eq!(f.satellite.current_scale, 2.0, "xdg-output v{version}");
+        output.mode(s_proto::wl_output::Mode::Current, 3000, 3000, 60000);
+        output.done();
+        f.run();
+        f.run();
+        assert_eq!(f.satellite.current_scale, 2.0);
+
+        // Reversed order has the same constraint, including a mode-only update.
+        output.mode(s_proto::wl_output::Mode::Current, 1500, 1500, 60000);
+        output.done();
+        f.run();
+        f.run();
+        assert_eq!(f.satellite.current_scale, 2.0);
+        xdg.logical_size(1000, 1000);
+        xdg.done();
+        f.run();
+        f.run();
+        assert_eq!(f.satellite.current_scale, 2.0);
+
+        // The fallback must keep following real scale changes in both directions.
+        for scale in [3, 1] {
+            output.scale(scale);
+            output.done();
+            f.run();
+            f.run();
+            assert_eq!(f.satellite.current_scale, f64::from(scale));
+        }
+    }
+}
+
+#[test]
+fn surface_scale_cannot_replace_integer_output_fallback_without_xdg_output() {
+    let mut f = TestFixture::new_pre_connect(|testwl| testwl.enable_fractional_scale());
+    let comp = f.compositor();
+    let (_, output) = f.new_output(0, 0);
+    output.scale(2);
+    output.done();
+    f.run();
+    f.run();
+    let (_, id) = f.create_toplevel(&comp, Window::new(1));
+    f.testwl.move_surface_to_output(id, &output);
+    f.testwl
+        .get_surface_data(id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .unwrap()
+        .preferred_scale(180);
+    f.run();
+    f.run();
+    assert_eq!(f.satellite.current_scale, 2.0);
+}
+
+#[test]
+fn integer_output_updates_preserve_fractional_surface_scale() {
+    fn assert_surface_scale(
+        f: &TestFixture<FakeXConnection>,
+        window: Window,
+        id: testwl::SurfaceId,
+        expected: (f64, i32),
+    ) {
+        let scale = f
+            .satellite
+            .world
+            .get::<&super::event::SurfaceScaleFactor>(f.satellite.windows[&window])
+            .unwrap()
+            .0;
+        let width = f
+            .testwl
+            .get_surface_data(id)
+            .unwrap()
+            .viewport
+            .as_ref()
+            .unwrap()
+            .width;
+        assert_eq!((scale, width), expected);
+    }
+
+    for version in [None, Some(1), Some(2)] {
+        for output_first in [true, false] {
+            let mut f = TestFixture::new_pre_connect(|testwl| testwl.enable_fractional_scale());
+            let comp = f.compositor();
+            let manager = version.map(|v| f.enable_xdg_output_version(v));
+            let (client, output) = f.new_output(0, 0);
+            if let Some(manager) = manager {
+                f.create_xdg_output(&manager, client.obj);
+            }
+            output.scale(2);
+            output.done();
+            f.run();
+            f.run();
+            let window = Window::new(1);
+            let (_, id) = f.create_toplevel(&comp, window);
+            f.testwl.move_surface_to_output(id, &output);
+            f.run();
+            f.run();
+
+            // Before the first preference, retain the surface's initial scale.
+            output.scale(3);
+            output.done();
+            f.run();
+            f.run();
+            assert_surface_scale(&f, window, id, (2.0, 100));
+            let fractional = f
+                .testwl
+                .get_surface_data(id)
+                .unwrap()
+                .fractional
+                .clone()
+                .unwrap();
+            fractional.preferred_scale(180);
+            output.scale(2);
+            output.done();
+            f.run();
+            f.run();
+            assert_surface_scale(&f, window, id, (1.5, 133));
+
+            // Both event orders must preserve the surface preference and viewport.
+            if !output_first {
+                fractional.preferred_scale(270);
+            }
+            output.scale(3);
+            output.done();
+            if output_first {
+                fractional.preferred_scale(270);
+            }
+            f.run();
+            f.run();
+            assert_eq!(f.satellite.current_scale, 3.0);
+            assert_surface_scale(&f, window, id, (2.25, 89));
+
+            // No new preferred_scale is required when only the output changes.
+            output.scale(4);
+            output.done();
+            f.run();
+            f.run();
+            assert_eq!(f.satellite.current_scale, 4.0);
+            assert_surface_scale(&f, window, id, (2.25, 89));
+        }
+    }
+}
+
+#[test]
+fn integer_output_updates_surface_scale_without_fractional_protocol() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let (_, output) = f.new_output(0, 0);
+    output.scale(2);
+    output.done();
+    f.run();
+    f.run();
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    f.run();
+    output.scale(3);
+    output.done();
+    f.run();
+    f.run();
+    let scale = f
+        .satellite
+        .world
+        .get::<&super::event::SurfaceScaleFactor>(f.satellite.windows[&window])
+        .unwrap()
+        .0;
+    let width = f
+        .testwl
+        .get_surface_data(id)
+        .unwrap()
+        .viewport
+        .as_ref()
+        .unwrap()
+        .width;
+    assert_eq!((f.satellite.current_scale, scale, width), (3.0, 3.0, 67));
+}
+
+#[test]
 fn client_side_decorations() {
     let (mut f, compositor) = TestFixture::new_with_compositor();
     let window = Window::new(1);
@@ -3124,7 +3691,8 @@ fn client_side_decorations() {
     f.testwl.configure_toplevel(id, 100, 100, vec![]);
     f.run();
 
-    check_window_and_viewport_size(&f, window, id, 100, 75);
+    let bar_h = super::decoration::DecorationsDataSatellite::calculate_titlebar_height();
+    check_window_and_viewport_size(&f, window, id, 100, (100 - bar_h) as u16);
 
     let subsurface_id = f.testwl.last_created_surface_id().unwrap();
     assert_ne!(subsurface_id, id);
@@ -3133,7 +3701,8 @@ fn client_side_decorations() {
     let Some(SurfaceRole::Subsurface(subsurface)) = &data.role else {
         panic!("surface was not a subsurface: {:?}", data.role);
     };
-    assert_eq!(subsurface.position, testwl::Vec2 { x: 0, y: -25 });
+    let bar_h = super::decoration::DecorationsDataSatellite::calculate_titlebar_height();
+    assert_eq!(subsurface.position, testwl::Vec2 { x: 0, y: -bar_h });
     assert_eq!(subsurface.parent, id);
     let subsurface = subsurface.subsurface.clone();
 
@@ -3178,7 +3747,7 @@ fn client_side_decorations_fractional_scale() {
         .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
     f.run();
 
-    let content_height = 100.0 - f64::from(DecorationsDataSatellite::TITLEBAR_HEIGHT);
+    let content_height = 100.0 - f64::from(DecorationsDataSatellite::calculate_titlebar_height());
     let scales: [(f64, u32); 2] = [(1.5, 180), (1.25, 150)];
     for (scale, preferred) in scales {
         let data = f.testwl.get_surface_data(id).unwrap();
@@ -3190,8 +3759,8 @@ fn client_side_decorations_fractional_scale() {
         f.run();
         f.run();
 
-        let x_width = (100.0 * scale).floor() as u16;
-        let x_height = (content_height * scale) as u16;
+        let x_width = (100.0 * scale).round() as u16;
+        let x_height = (content_height * scale).round() as u16;
         let dims = f.connection().window(window).dims;
         assert_eq!(
             (dims.width, dims.height),
@@ -3226,6 +3795,7 @@ fn client_side_decorations_no_global() {
             height: 50,
         },
         fullscreen: false,
+        maximized: false,
     };
 
     f.new_window(window, false, data);
@@ -3247,7 +3817,9 @@ fn client_side_decorations_no_global() {
                 toplevel = Some(*id);
             }
             SurfaceRole::Subsurface(sub) => {
-                assert_eq!(sub.position, testwl::Vec2 { x: 0, y: -25 });
+                let bar_h =
+                    super::decoration::DecorationsDataSatellite::calculate_titlebar_height();
+                assert_eq!(sub.position, testwl::Vec2 { x: 0, y: -bar_h });
                 subsurface_parent = Some(sub.parent);
             }
             other => panic!("got surface with unexpected role: {other:?}"),
@@ -3267,7 +3839,8 @@ fn resize_decorations_on_reconfigure() {
     f.testwl.configure_toplevel(id, 100, 100, vec![]);
     f.run();
 
-    check_window_and_viewport_size(&f, window, id, 100, 75);
+    let bar_h = super::decoration::DecorationsDataSatellite::calculate_titlebar_height();
+    check_window_and_viewport_size(&f, window, id, 100, (100 - bar_h) as u16);
 
     let subsurface_id = f.testwl.last_created_surface_id().unwrap();
     assert_ne!(subsurface_id, id);
@@ -3275,7 +3848,7 @@ fn resize_decorations_on_reconfigure() {
     let buf_dims = f
         .testwl
         .get_buffer_dimensions(data.buffer.as_ref().expect("Missing buffer for subsurface"));
-    assert_eq!(buf_dims, testwl::Vec2 { x: 100, y: 25 });
+    assert_eq!(buf_dims, testwl::Vec2 { x: 100, y: bar_h });
     assert!(
         matches!(data.role, Some(SurfaceRole::Subsurface(_))),
         "surface was not a subsurface: {:?}",
@@ -3286,7 +3859,7 @@ fn resize_decorations_on_reconfigure() {
     // is used as a fallback in this case, do not reapply the height reduction from the titlebar.
     f.testwl.configure_toplevel(id, 0, 0, vec![]);
     f.run();
-    check_window_and_viewport_size(&f, window, id, 100, 75);
+    check_window_and_viewport_size(&f, window, id, 100, (100 - bar_h) as u16);
 
     let dims = WindowDims {
         x: 0,
@@ -3302,7 +3875,8 @@ fn resize_decorations_on_reconfigure() {
     let buf_dims = f
         .testwl
         .get_buffer_dimensions(data.buffer.as_ref().expect("Missing buffer for subsurface"));
-    assert_eq!(buf_dims, testwl::Vec2 { x: 200, y: 25 });
+    let bar_h = super::decoration::DecorationsDataSatellite::calculate_titlebar_height();
+    assert_eq!(buf_dims, testwl::Vec2 { x: 200, y: bar_h });
 }
 
 #[test]
@@ -3358,3 +3932,1103 @@ fn decorations_max_height_int_max() {
 /// See Pointer::handle_event for an explanation.
 #[test]
 fn popup_pointer_motion_workaround() {}
+
+fn cursor_viewport(f: &TestFixture<FakeXConnection>) -> (i32, i32) {
+    let id = f
+        .testwl
+        .last_created_surface_id()
+        .expect("cursor surface was not created");
+    let data = f
+        .testwl
+        .get_surface_data(id)
+        .expect("missing cursor surface");
+    let viewport = data
+        .viewport
+        .as_ref()
+        .expect("cursor surface has no viewport");
+    (viewport.width, viewport.height)
+}
+
+fn scaled_cursor_fixture() -> (
+    TestFixture<FakeXConnection>,
+    Compositor,
+    TestObject<WlPointer>,
+) {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let pointer =
+        TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+    let (_, output) = f.new_output(0, 0);
+    output.scale(2);
+    output.done();
+    f.run();
+    f.run();
+    (f, comp, pointer)
+}
+
+// X clients that follow Xft.dpi draw cursors at the same scale as their
+// windows, so a 2x cursor image on a 2x output is shown at the nominal
+// logical size and its hotspot is halved too.
+#[test]
+fn scaled_output_cursor_is_shown_at_logical_size() {
+    let (mut f, comp, pointer) = scaled_cursor_fixture();
+    let base = super::event::cursor_base_size();
+
+    comp.set_cursor(&pointer, base * 2, base * 2, (10, 21));
+    f.run();
+
+    assert_eq!(cursor_viewport(&f), (base, base));
+    assert_eq!(f.testwl.cursor_hotspot(), Some((5, 11)));
+}
+
+// A client that ignores the DPI (e.g. the self-drawn part of the Unity editor)
+// sends a nominal-size image. Halving it would make it tiny, so it is left
+// alone, and the hotspot forwarded before the image was known is re-sent.
+#[test]
+fn scaled_output_nominal_size_cursor_is_left_alone() {
+    let (mut f, comp, pointer) = scaled_cursor_fixture();
+    let base = super::event::cursor_base_size();
+
+    comp.set_cursor(&pointer, base, base, (10, 21));
+    f.run();
+
+    assert_eq!(cursor_viewport(&f), (-1, -1));
+    assert_eq!(f.testwl.cursor_hotspot(), Some((10, 21)));
+}
+
+// Both kinds of cursor can alternate on one surface (Xwayland reuses it), and
+// each image gets its own factor.
+#[test]
+fn scaled_output_cursor_factor_follows_each_image() {
+    let (mut f, comp, pointer) = scaled_cursor_fixture();
+    let base = super::event::cursor_base_size();
+
+    let surface = comp.set_cursor(&pointer, base, base, (10, 20));
+    f.run();
+    assert_eq!(cursor_viewport(&f), (-1, -1));
+    assert_eq!(f.testwl.cursor_hotspot(), Some((10, 20)));
+
+    comp.set_cursor_on(&pointer, &surface, base * 2, base * 2, (10, 20));
+    f.run();
+    assert_eq!(cursor_viewport(&f), (base, base));
+    assert_eq!(f.testwl.cursor_hotspot(), Some((5, 10)));
+
+    comp.set_cursor_on(&pointer, &surface, base, base, (10, 20));
+    f.run();
+    assert_eq!(cursor_viewport(&f), (-1, -1));
+    assert_eq!(f.testwl.cursor_hotspot(), Some((10, 20)));
+}
+
+// Fractional scales use the same factor X is given through Xft.dpi, rounding
+// the logical size to whole pixels.
+#[test]
+fn fractional_scale_cursor_is_shown_at_logical_size() {
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let comp = f.compositor();
+    let pointer =
+        TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+    let manager = f.enable_xdg_output();
+    let output = f.new_fractional_output(&manager, 0, 1.5);
+    let window = Window::new(1);
+    let (_, surface_id) = f.create_toplevel(&comp, window);
+    let fractional = f
+        .testwl
+        .get_surface_data(surface_id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .cloned()
+        .expect("No fractional scale for surface");
+    fractional.preferred_scale(180); // 1.5 scale
+    f.testwl.move_surface_to_output(surface_id, &output);
+    f.run();
+    f.run();
+
+    let base = super::event::cursor_base_size();
+    let size = (base as f64 * 1.5) as i32;
+    comp.set_cursor(&pointer, size, size, (9, 3));
+    f.run();
+
+    assert_eq!(cursor_viewport(&f), (base, base));
+    assert_eq!(f.testwl.cursor_hotspot(), Some((6, 2)));
+}
+
+// Without scaling the cursor passes through untouched.
+#[test]
+fn unscaled_cursor_is_left_alone() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let pointer =
+        TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+    f.new_output(0, 0);
+    f.run();
+
+    comp.set_cursor(&pointer, 48, 48, (10, 21));
+    f.run();
+
+    assert_eq!(cursor_viewport(&f), (-1, -1));
+    assert_eq!(f.testwl.cursor_hotspot(), Some((10, 21)));
+}
+
+#[test]
+fn cursor_factor_picks_the_size_closer_to_nominal() {
+    use super::event::{BufferSize, CursorSurface};
+    let size = |px| BufferSize {
+        width: px,
+        height: px,
+    };
+    // Nominal size: left alone. DPI-scaled size: divided.
+    assert_eq!(CursorSurface::factor_for(2.0, 24, size(24)), 1.0);
+    assert_eq!(CursorSurface::factor_for(2.0, 24, size(48)), 2.0);
+    assert_eq!(CursorSurface::factor_for(1.8, 24, size(24)), 1.0);
+    // 24 × 1.8 ≈ 43, which themes round to their 40 or 48 px images.
+    assert_eq!(CursorSurface::factor_for(1.8, 24, size(40)), 1.8);
+    assert_eq!(CursorSurface::factor_for(1.8, 24, size(48)), 1.8);
+    // The boundary is the geometric midpoint, 24 × √2 ≈ 34 at 2x.
+    assert_eq!(CursorSurface::factor_for(2.0, 24, size(32)), 1.0);
+    assert_eq!(CursorSurface::factor_for(2.0, 24, size(36)), 2.0);
+    // Nothing to do at 1x or without an image.
+    assert_eq!(CursorSurface::factor_for(1.0, 24, size(48)), 1.0);
+    assert_eq!(CursorSurface::factor_for(2.0, 24, size(0)), 1.0);
+}
+
+mod cursor_shapes {
+    use super::*;
+    use testwl::PointerCursorRequest;
+    use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::Shape;
+
+    fn fixture(
+        cursor_shape: bool,
+    ) -> (
+        TestFixture<FakeXConnection>,
+        Compositor,
+        TestObject<WlPointer>,
+    ) {
+        let mut f = TestFixture::new_pre_connect(|testwl| {
+            if cursor_shape {
+                testwl.enable_cursor_shape();
+            }
+        });
+        let comp = f.compositor();
+        let pointer =
+            TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+        f.new_output(0, 0);
+        f.run();
+        (f, comp, pointer)
+    }
+
+    fn cursor_surface(f: &TestFixture<FakeXConnection>) -> PointerCursorRequest {
+        PointerCursorRequest::Surface(f.testwl.last_created_surface_id().unwrap())
+    }
+
+    // A cursor XFixes knows by name is drawn by the compositor from its own
+    // theme, instead of from Xwayland's image.
+    #[test]
+    fn named_x_cursor_is_forwarded_as_shape() {
+        let (mut f, comp, pointer) = fixture(true);
+        f.satellite.set_x_cursor_name(Some("xterm"));
+        comp.set_cursor(&pointer, 24, 24, (12, 12));
+        f.run();
+
+        assert_eq!(
+            f.testwl.pointer_cursor(),
+            Some(PointerCursorRequest::Shape(Shape::Text))
+        );
+    }
+
+    // The name arrives on the X connection and the image on the Wayland one, in
+    // either order; whichever comes last decides.
+    #[test]
+    fn name_arriving_after_the_image_switches_between_shape_and_image() {
+        let (mut f, comp, pointer) = fixture(true);
+        comp.set_cursor(&pointer, 24, 24, (5, 1));
+        f.run();
+        assert_eq!(f.testwl.pointer_cursor(), Some(cursor_surface(&f)));
+
+        f.satellite.set_x_cursor_name(Some("left_ptr"));
+        f.run();
+        assert_eq!(
+            f.testwl.pointer_cursor(),
+            Some(PointerCursorRequest::Shape(Shape::Default))
+        );
+
+        // An unnamed cursor (a custom image) goes back to the image, with the
+        // hotspot Xwayland gave for it.
+        f.satellite.set_x_cursor_name(None);
+        f.run();
+        assert_eq!(f.testwl.pointer_cursor(), Some(cursor_surface(&f)));
+        assert_eq!(f.testwl.cursor_hotspot(), Some((5, 1)));
+    }
+
+    #[test]
+    fn unknown_name_keeps_the_image() {
+        let (mut f, comp, pointer) = fixture(true);
+        f.satellite.set_x_cursor_name(Some("my-custom-crosshair"));
+        comp.set_cursor(&pointer, 24, 24, (12, 12));
+        f.run();
+
+        assert_eq!(f.testwl.pointer_cursor(), Some(cursor_surface(&f)));
+    }
+
+    #[test]
+    fn without_cursor_shape_support_the_image_is_used() {
+        let (mut f, comp, pointer) = fixture(false);
+        f.satellite.set_x_cursor_name(Some("xterm"));
+        comp.set_cursor(&pointer, 24, 24, (12, 12));
+        f.run();
+
+        assert_eq!(f.testwl.pointer_cursor(), Some(cursor_surface(&f)));
+        assert_eq!(f.testwl.cursor_hotspot(), Some((12, 12)));
+    }
+
+    #[test]
+    fn hidden_cursor_stays_hidden_whatever_its_name() {
+        let (mut f, comp, pointer) = fixture(true);
+        f.satellite.set_x_cursor_name(Some("left_ptr"));
+        comp.set_cursor(&pointer, 24, 24, (5, 1));
+        f.run();
+        pointer
+            .send_request(Req::<WlPointer>::SetCursor {
+                serial: 0,
+                surface: None,
+                hotspot_x: 0,
+                hotspot_y: 0,
+            })
+            .unwrap();
+        f.run();
+
+        assert_eq!(
+            f.testwl.pointer_cursor(),
+            Some(PointerCursorRequest::Hidden)
+        );
+    }
+}
+
+#[test]
+fn test_recalculate_x11_output_positions_multi_scale() {
+    use super::event::{
+        OutputDimensions, OutputDimensionsSource, OutputScaleFactor, TrueOutputScaleFactor,
+        X11OutputPosition, recalculate_x11_output_positions,
+    };
+    use hecs::World;
+
+    let mut world = World::new();
+
+    // m1: 2560x1600 @ 1.75
+    // m2: 1920x1080 @ 1.0 at x=1463 (2560/1.75)
+    let m1 = world.spawn((
+        OutputDimensions {
+            source: OutputDimensionsSource::Xdg,
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1600,
+            ..Default::default()
+        },
+        TrueOutputScaleFactor(OutputScaleFactor::Fractional(1.75)),
+    ));
+
+    let m2 = world.spawn((
+        OutputDimensions {
+            source: OutputDimensionsSource::Xdg,
+            x: 1463,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            ..Default::default()
+        },
+        TrueOutputScaleFactor(OutputScaleFactor::Fractional(1.0)),
+    ));
+
+    recalculate_x11_output_positions(&mut world, true, 1.75);
+
+    let pos1 = world.get::<&X11OutputPosition>(m1).unwrap();
+    assert_eq!(pos1.x, 0);
+    assert_eq!(pos1.y, 0);
+
+    // 1463 * 1.75 = 2560
+    let pos2 = world.get::<&X11OutputPosition>(m2).unwrap();
+    assert_eq!(pos2.x, 2560);
+    assert_eq!(pos2.y, 0);
+}
+
+#[test]
+fn test_recalculate_x11_output_positions_rotated() {
+    use super::event::{
+        OutputDimensions, OutputDimensionsSource, OutputScaleFactor, TrueOutputScaleFactor,
+        X11OutputPosition, recalculate_x11_output_positions,
+    };
+    use hecs::World;
+
+    let mut world = World::new();
+
+    // m1 (rotated 90): 2560x1600 @ 1.75. logical width is physical height (1600)
+    // logical width: 1600/1.75 = 914
+    // m2: 1920x1080 @ 1.0 at x=914
+    let m1 = world.spawn((
+        OutputDimensions {
+            source: OutputDimensionsSource::Xdg,
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1600,
+            rotated_90: true,
+            ..Default::default()
+        },
+        TrueOutputScaleFactor(OutputScaleFactor::Fractional(1.75)),
+    ));
+
+    let m2 = world.spawn((
+        OutputDimensions {
+            source: OutputDimensionsSource::Xdg,
+            x: 914,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            rotated_90: false,
+            ..Default::default()
+        },
+        TrueOutputScaleFactor(OutputScaleFactor::Fractional(1.0)),
+    ));
+
+    recalculate_x11_output_positions(&mut world, true, 1.75);
+
+    let pos1 = world.get::<&X11OutputPosition>(m1).unwrap();
+    assert_eq!(pos1.x, 0);
+    assert_eq!(pos1.y, 0);
+
+    // 914 * 1.75 = 1600
+    let pos2 = world.get::<&X11OutputPosition>(m2).unwrap();
+    assert_eq!(pos2.x, 1600);
+    assert_eq!(pos2.y, 0);
+}
+
+#[test]
+fn test_recalculate_x11_output_positions_2d_l_shape() {
+    use super::event::{
+        OutputDimensions, OutputDimensionsSource, OutputScaleFactor, TrueOutputScaleFactor,
+        X11OutputPosition, recalculate_x11_output_positions,
+    };
+    use hecs::World;
+
+    let mut world = World::new();
+
+    // m1 (scale 2.0): starts at (0, 0), logical size 960x540
+    let m1 = world.spawn((
+        OutputDimensions {
+            source: OutputDimensionsSource::Xdg,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            ..Default::default()
+        },
+        TrueOutputScaleFactor(OutputScaleFactor::Fractional(2.0)),
+    ));
+
+    // m2 (scale 1.5): starts at (960, 0) (to the right of m1)
+    let m2 = world.spawn((
+        OutputDimensions {
+            source: OutputDimensionsSource::Xdg,
+            x: 960,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            ..Default::default()
+        },
+        TrueOutputScaleFactor(OutputScaleFactor::Fractional(1.5)),
+    ));
+
+    // m3 (scale 1.0): starts at (0, 540) (below m1)
+    let m3 = world.spawn((
+        OutputDimensions {
+            source: OutputDimensionsSource::Xdg,
+            x: 0,
+            y: 540,
+            width: 1920,
+            height: 1080,
+            ..Default::default()
+        },
+        TrueOutputScaleFactor(OutputScaleFactor::Fractional(1.0)),
+    ));
+
+    recalculate_x11_output_positions(&mut world, true, 2.0);
+
+    let pos1 = world.get::<&X11OutputPosition>(m1).unwrap();
+    assert_eq!(pos1.x, 0);
+    assert_eq!(pos1.y, 0);
+
+    // 960 * 2.0 = 1920
+    let pos2 = world.get::<&X11OutputPosition>(m2).unwrap();
+    assert_eq!(pos2.x, 1920);
+    assert_eq!(pos2.y, 0);
+
+    // 540 * 2.0 = 1080
+    let pos3 = world.get::<&X11OutputPosition>(m3).unwrap();
+    assert_eq!(pos3.x, 0);
+    assert_eq!(pos3.y, 1080);
+}
+
+#[test]
+fn test_window_offset_with_compositor_scaling() {
+    use super::event::{
+        OnOutput, OutputDimensions, OutputDimensionsSource, OutputScaleFactor,
+        TrueOutputScaleFactor, recalculate_x11_output_positions, update_window_output_offsets,
+    };
+    use crate::xstate::WindowDims;
+    use hecs::World;
+
+    let mut world = World::new();
+
+    // m1: 2560x1600 @ 1.75
+    // m2: 1920x1080 @ 1.0 at x=1463
+    let m1 = world.spawn((
+        OutputDimensions {
+            source: OutputDimensionsSource::Xdg,
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1600,
+            ..Default::default()
+        },
+        TrueOutputScaleFactor(OutputScaleFactor::Fractional(1.75)),
+    ));
+
+    let m2 = world.spawn((
+        OutputDimensions {
+            source: OutputDimensionsSource::Xdg,
+            x: 1463,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            ..Default::default()
+        },
+        TrueOutputScaleFactor(OutputScaleFactor::Fractional(1.0)),
+    ));
+
+    recalculate_x11_output_positions(&mut world, true, 1.75);
+
+    let win_id = Window::new(123);
+    let mut win_data = super::WindowData::new(
+        false,
+        WindowDims {
+            x: 100,
+            y: 100,
+            width: 200,
+            height: 200,
+        },
+        None,
+    );
+    win_data.mapped = true;
+
+    let window_entity = world.spawn((win_id, win_data, OnOutput(m2)));
+
+    let mut conn = FakeXConnection::default();
+    conn.windows.insert(
+        win_id,
+        WindowData {
+            mapped: true,
+            fullscreen: false,
+            maximized: false,
+            dims: WindowDims {
+                x: 100,
+                y: 100,
+                width: 200,
+                height: 200,
+            },
+        },
+    );
+
+    let global_offset = super::GlobalOutputOffset {
+        x: super::GlobalOutputOffsetDimension {
+            owner: Some(m1),
+            value: 0,
+        },
+        y: super::GlobalOutputOffsetDimension {
+            owner: Some(m1),
+            value: 0,
+        },
+    };
+
+    update_window_output_offsets(m2, &global_offset, &world, &mut conn);
+
+    // Window offset matches X11 output position (2560), not logical offset (1463)
+    let win_data = world.get::<&super::WindowData>(window_entity).unwrap();
+    assert_eq!(win_data.output_offset.x, 2560);
+    assert_eq!(win_data.output_offset.y, 0);
+}
+
+#[test]
+fn test_monitor_disconnect_scaling_fallback() {
+    use super::WindowOutputOffset;
+    use super::event::{
+        EnteredOutputs, OnOutput, OutputDimensions, OutputDimensionsSource, OutputScaleFactor,
+        SurfaceScaleFactor, TrueOutputScaleFactor, X11OutputPosition, update_output_scale,
+    };
+    use crate::xstate::WindowDims;
+    use hecs::World;
+
+    let mut world = World::new();
+
+    // m1: 1.75 scale at (100, 200)
+    // m2: 1.0 scale (will be disconnected)
+    let m1 = world.spawn((
+        OutputDimensions {
+            source: OutputDimensionsSource::Xdg,
+            x: 100,
+            y: 200,
+            width: 2560,
+            height: 1600,
+            ..Default::default()
+        },
+        OutputScaleFactor::Fractional(1.75),
+        TrueOutputScaleFactor(OutputScaleFactor::Fractional(1.75)),
+    ));
+
+    let m2 = world.spawn((
+        OutputDimensions {
+            source: OutputDimensionsSource::Xdg,
+            x: 1463,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            ..Default::default()
+        },
+        OutputScaleFactor::Fractional(1.0),
+        TrueOutputScaleFactor(OutputScaleFactor::Fractional(1.0)),
+    ));
+
+    // Window overlaps m1 and m2, assigned to m2
+    let window_entity = world.spawn((
+        Window::new(123),
+        super::WindowData::new(
+            false,
+            WindowDims {
+                x: 1500,
+                y: 100,
+                width: 200,
+                height: 200,
+            },
+            None,
+        ),
+        OnOutput(m2),
+        EnteredOutputs(vec![m1, m2]),
+        SurfaceScaleFactor(1.0),
+    ));
+
+    let mut updated_outputs = Vec::new();
+    let mut surfaces_to_update = Vec::new();
+
+    world
+        .remove::<(OutputScaleFactor, TrueOutputScaleFactor, OutputDimensions)>(m2)
+        .unwrap();
+
+    for (e, (on_out, mut entered)) in
+        world.query_mut::<(Option<&mut OnOutput>, Option<&mut EnteredOutputs>)>()
+    {
+        if let Some(ref mut entered) = entered {
+            entered.0.retain(|&out| out != m2);
+        }
+        if let Some(on_out) = on_out {
+            if on_out.0 == m2 {
+                let mut fallback = None;
+                if let Some(ref entered) = entered {
+                    if let Some(&next_out) = entered.0.first() {
+                        fallback = Some(next_out);
+                    }
+                }
+                if let Some(next_out) = fallback {
+                    *on_out = OnOutput(next_out);
+                    surfaces_to_update.push((e, next_out));
+                } else {
+                    surfaces_to_update.push((e, hecs::Entity::DANGLING));
+                }
+            }
+        }
+    }
+    for (e, next_out) in surfaces_to_update {
+        if next_out == hecs::Entity::DANGLING {
+            let _ = world.remove_one::<OnOutput>(e);
+        } else if let Ok(scale) = world.get::<&SurfaceScaleFactor>(e) {
+            let scale_val = scale.0;
+
+            let mut query = world
+                .query_one::<(&Window, &mut super::WindowData)>(e)
+                .unwrap();
+            if let Some((window, win_data)) = query.get() {
+                if let Ok(dimensions) = world.get::<&OutputDimensions>(next_out) {
+                    let (ox, oy) = if let Ok(pos) = world.get::<&X11OutputPosition>(next_out) {
+                        (pos.x, pos.y)
+                    } else {
+                        (dimensions.x, dimensions.y)
+                    };
+                    let mut conn = FakeXConnection::default();
+                    conn.windows.insert(
+                        *window,
+                        WindowData {
+                            mapped: true,
+                            fullscreen: false,
+                            maximized: false,
+                            dims: WindowDims {
+                                x: 1500,
+                                y: 100,
+                                width: 200,
+                                height: 200,
+                            },
+                        },
+                    );
+                    win_data.update_output_offset(
+                        *window,
+                        WindowOutputOffset { x: ox, y: oy },
+                        &mut conn,
+                    );
+                }
+            }
+            drop(query);
+
+            if let Ok(out_query) =
+                world.query_one::<(&mut OutputScaleFactor, &mut TrueOutputScaleFactor)>(next_out)
+            {
+                if update_output_scale(
+                    out_query,
+                    OutputScaleFactor::Fractional(scale_val),
+                    false,
+                    1.0,
+                ) {
+                    updated_outputs.push(next_out);
+                }
+            }
+        }
+    }
+
+    let new_on_output = world.get::<&OnOutput>(window_entity).unwrap();
+    assert_eq!(new_on_output.0, m1);
+
+    let entered = world.get::<&EnteredOutputs>(window_entity).unwrap();
+    assert_eq!(entered.0, vec![m1]);
+
+    assert!(updated_outputs.contains(&m1));
+    let m1_scale = world.get::<&OutputScaleFactor>(m1).unwrap();
+    assert_eq!(m1_scale.get(), 1.0);
+
+    let win_data = world.get::<&super::WindowData>(window_entity).unwrap();
+    assert_eq!(win_data.output_offset.x, 100);
+    assert_eq!(win_data.output_offset.y, 200);
+}
+
+#[test]
+fn reconfigure_popup_with_decorations() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let toplevel = Window::new(1);
+    let (_, t_id) = f.create_toplevel(&comp, toplevel);
+
+    f.testwl
+        .force_decoration_mode(t_id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl
+        .configure_toplevel(t_id, 100, 100, vec![xdg_toplevel::State::Activated]);
+    f.run();
+
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(
+        &comp,
+        PopupBuilder::new(popup, toplevel, t_id)
+            .x(20)
+            .y(40)
+            .check_size_and_pos(false),
+    );
+    f.satellite.set_transient_for(popup, toplevel);
+
+    let surface_data = f.testwl.get_surface_data(p_id).unwrap();
+    let pos = &surface_data.popup().positioner_state;
+    let bar_h = super::decoration::DecorationsDataSatellite::calculate_titlebar_height();
+    assert_eq!(
+        pos.offset,
+        testwl::Vec2 {
+            x: 20,
+            y: 40 - bar_h
+        }
+    );
+
+    let new_popup_dims = WindowDims {
+        x: 30,
+        y: 50,
+        width: 50,
+        height: 50,
+    };
+    f.reconfigure_window(popup, new_popup_dims, true);
+    f.run();
+
+    let surface_data2 = f.testwl.get_surface_data(p_id).unwrap();
+    let pos2 = &surface_data2.popup().positioner_state;
+    let bar_h = super::decoration::DecorationsDataSatellite::calculate_titlebar_height();
+    assert_eq!(
+        pos2.offset,
+        testwl::Vec2 {
+            x: 30,
+            y: 50 - bar_h
+        }
+    );
+}
+
+#[test]
+fn test_get_surface_input_scales_rotated_compositor_scaling() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+
+    f.satellite.compositor_scaling = true;
+
+    let (_, _) = f.new_output(0, 0);
+
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+
+    f.testwl
+        .configure_toplevel(id, 2800, 4480, vec![xdg_toplevel::State::Fullscreen]);
+    f.run();
+
+    let window_entity = f
+        .satellite
+        .inner
+        .world
+        .query::<&Window>()
+        .iter()
+        .find(|(_, w)| **w == win)
+        .map(|(e, _)| e)
+        .unwrap();
+
+    let output_entity = f
+        .satellite
+        .inner
+        .world
+        .query::<&super::event::OutputDimensions>()
+        .iter()
+        .find(|(_, dims)| dims.x == 0 && dims.y == 0)
+        .map(|(e, _)| e)
+        .unwrap();
+
+    f.satellite
+        .inner
+        .world
+        .insert_one(window_entity, super::event::OnOutput(output_entity))
+        .unwrap();
+
+    {
+        f.satellite
+            .inner
+            .world
+            .insert_one(
+                output_entity,
+                super::event::TrueOutputScaleFactor(super::event::OutputScaleFactor::Fractional(
+                    1.75,
+                )),
+            )
+            .unwrap();
+
+        let mut dims = f
+            .satellite
+            .inner
+            .world
+            .get::<&mut super::event::OutputDimensions>(output_entity)
+            .unwrap();
+        dims.width = 2560;
+        dims.height = 1600;
+        dims.rotated_90 = true;
+    }
+
+    // When rotated 90, physical width becomes height
+    {
+        let mut win_data = f
+            .satellite
+            .inner
+            .world
+            .get::<&mut super::WindowData>(window_entity)
+            .unwrap();
+        win_data.attrs.dims.width = 2800;
+        win_data.attrs.dims.height = 4480;
+    }
+
+    let (scale_x, scale_y) =
+        super::event::get_surface_input_scales(&f.satellite.inner.world, window_entity);
+
+    assert!((scale_x - 1.75).abs() < 1e-5);
+    assert!((scale_y - 1.75).abs() < 1e-5);
+}
+
+#[test]
+fn test_base_scale_override() {
+    let (mut f, _comp) = TestFixture::new_with_compositor();
+    f.satellite.compositor_scaling = true;
+
+    // set base scale to 1.0
+    unsafe {
+        std::env::set_var("XWAYLAND_SATELLITE_BASE_SCALE", "1.0");
+    }
+
+    let (_, _) = f.new_output(0, 0);
+
+    let output_entity = f
+        .satellite
+        .inner
+        .world
+        .query::<&super::event::OutputDimensions>()
+        .iter()
+        .map(|(e, _)| e)
+        .next()
+        .unwrap();
+
+    f.satellite
+        .inner
+        .world
+        .insert_one(
+            output_entity,
+            super::event::TrueOutputScaleFactor(super::event::OutputScaleFactor::Fractional(1.75)),
+        )
+        .unwrap();
+
+    f.satellite.inner.updated_outputs.push(output_entity);
+    f.satellite.update_compositor_scaling_state();
+
+    // assert 1.0 overrides 1.75
+    assert_eq!(f.satellite.inner.global_scale, 1.0);
+
+    // reset env
+    unsafe {
+        std::env::remove_var("XWAYLAND_SATELLITE_BASE_SCALE");
+    }
+}
+
+#[test]
+fn maximized_pre_mapping() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(2);
+
+    let data = WindowData {
+        mapped: true,
+        dims: WindowDims {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        },
+        fullscreen: false,
+        maximized: false,
+    };
+    f.new_window(win, false, data);
+
+    // Set maximized before mapping
+    f.satellite.set_maximized(win, SetState::Add);
+
+    let (buffer, surface) = comp.create_surface();
+    f.map_window(&comp, win, &surface.obj, &buffer);
+    f.run();
+    f.run();
+
+    let id = f.check_new_surface();
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        data.toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+}
+
+#[test]
+fn input_region_scaling() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (surface, id) = f.create_toplevel(&comp, win);
+
+    let surface_entity = f.satellite.windows[&win];
+    f.satellite
+        .world
+        .get::<&mut super::event::SurfaceScaleFactor>(surface_entity)
+        .unwrap()
+        .0 = 2.0;
+
+    let region = comp.create_region();
+    region
+        .send_request(Req::<WlRegion>::Add {
+            x: 20,
+            y: 40,
+            width: 200,
+            height: 100,
+        })
+        .unwrap();
+
+    surface
+        .send_request(Req::<WlSurface>::SetInputRegion {
+            region: Some(region.obj.clone()),
+        })
+        .unwrap();
+    surface.send_request(Req::<WlSurface>::Commit {}).unwrap();
+
+    f.run();
+    f.run();
+
+    let surface_data = f.testwl.get_surface_data(id).unwrap();
+    // Scale 2.0 downsamples [20, 40, 200, 100] to [10, 20, 100, 50]
+    assert_eq!(surface_data.input_region, Some(vec![(10, 20, 100, 50)]));
+
+    surface
+        .send_request(Req::<WlSurface>::SetInputRegion { region: None })
+        .unwrap();
+    surface.send_request(Req::<WlSurface>::Commit {}).unwrap();
+
+    f.run();
+    f.run();
+
+    let surface_data = f.testwl.get_surface_data(id).unwrap();
+    assert_eq!(surface_data.input_region, None);
+}
+
+#[test]
+fn input_region_complex_polygon_and_negative_coords() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (surface, id) = f.create_toplevel(&comp, win);
+
+    let surface_entity = f.satellite.windows[&win];
+    f.satellite
+        .world
+        .get::<&mut super::event::SurfaceScaleFactor>(surface_entity)
+        .unwrap()
+        .0 = 1.5;
+
+    let region = comp.create_region();
+    region
+        .send_request(Req::<WlRegion>::Add {
+            x: -60,
+            y: -30,
+            width: 60,
+            height: 30,
+        })
+        .unwrap();
+    region
+        .send_request(Req::<WlRegion>::Add {
+            x: 0,
+            y: -30,
+            width: 60,
+            height: 30,
+        })
+        .unwrap();
+    region
+        .send_request(Req::<WlRegion>::Add {
+            x: 60,
+            y: -30,
+            width: 60,
+            height: 30,
+        })
+        .unwrap();
+    region
+        .send_request(Req::<WlRegion>::Subtract {
+            x: 10,
+            y: -20,
+            width: 20,
+            height: 10,
+        })
+        .unwrap();
+
+    surface
+        .send_request(Req::<WlSurface>::SetInputRegion {
+            region: Some(region.obj.clone()),
+        })
+        .unwrap();
+    surface.send_request(Req::<WlSurface>::Commit {}).unwrap();
+
+    f.run();
+    f.run();
+
+    let surface_data = f.testwl.get_surface_data(id).unwrap();
+    let rects = surface_data.input_region.as_ref().unwrap();
+    assert_eq!(rects.len(), 3);
+
+    assert_eq!(rects[0].0 + rects[0].2, rects[1].0);
+    assert_eq!(rects[1].0 + rects[1].2, rects[2].0);
+
+    assert_eq!(rects[0], (-40, -20, 40, 20));
+    assert_eq!(rects[1], (0, -20, 40, 20));
+    assert_eq!(rects[2], (40, -20, 40, 20));
+}
+
+#[test]
+fn maximized_rapid_toggles_and_idempotence() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+
+    for _ in 0..5 {
+        f.satellite.set_maximized(win, SetState::Add);
+    }
+    f.run();
+    f.run();
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert_eq!(
+        data.toplevel()
+            .states
+            .iter()
+            .filter(|&&s| s == xdg_toplevel::State::Maximized)
+            .count(),
+        1
+    );
+
+    for i in 0..4 {
+        f.satellite.set_maximized(win, SetState::Toggle);
+        f.run();
+        f.run();
+        let data = f.testwl.get_surface_data(id).unwrap();
+        let is_max = data
+            .toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized);
+        assert_eq!(is_max, i % 2 == 1);
+    }
+
+    for _ in 0..5 {
+        f.satellite.set_maximized(win, SetState::Remove);
+    }
+    f.run();
+    f.run();
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        !data
+            .toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+}
+
+#[test]
+fn surface_destroy_with_active_input_region() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (surface, id) = f.create_toplevel(&comp, win);
+
+    for i in 1..=5 {
+        let region = comp.create_region();
+        region
+            .send_request(Req::<WlRegion>::Add {
+                x: i * 10,
+                y: i * 10,
+                width: 100,
+                height: 100,
+            })
+            .unwrap();
+        surface
+            .send_request(Req::<WlSurface>::SetInputRegion {
+                region: Some(region.obj),
+            })
+            .unwrap();
+        surface.send_request(Req::<WlSurface>::Commit {}).unwrap();
+        f.run();
+    }
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert_eq!(data.input_region, Some(vec![(50, 50, 100, 100)]));
+
+    f.satellite.unmap_window(win);
+    f.satellite.destroy_window(win);
+    surface.obj.destroy();
+    f.run();
+    f.run();
+
+    assert!(f.testwl.get_surface_data(id).is_none());
+}

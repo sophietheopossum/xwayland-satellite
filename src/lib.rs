@@ -19,8 +19,10 @@ pub trait XConnection: Sized + 'static {
 
     fn set_window_dims(&mut self, window: x::Window, dims: PendingSurfaceState) -> bool;
     fn set_fullscreen(&mut self, window: x::Window, fullscreen: bool);
+    fn set_maximized(&mut self, window: x::Window, maximized: bool);
     fn focus_window(&mut self, window: x::Window, output_name: Option<String>);
     fn send_take_focus(&mut self, window: x::Window);
+    fn focus_popup(&mut self, window: x::Window);
     fn close_window(&mut self, window: x::Window);
     fn unmap_window(&mut self, window: x::Window);
     fn raise_to_top(&mut self, window: x::Window);
@@ -39,6 +41,9 @@ pub trait RunData {
     fn listenfds(&mut self) -> Vec<OwnedFd>;
     fn flags(&self) -> &[String] {
         &[]
+    }
+    fn compositor_scaling(&self) -> bool {
+        false
     }
     fn server(&self) -> Option<UnixStream> {
         None
@@ -156,7 +161,8 @@ pub fn main(mut data: impl RunData) -> Option<()> {
         }
     };
 
-    let mut server_state = EarlyServerState::new(dh, data.server(), connection);
+    let mut server_state =
+        EarlyServerState::new(dh, data.server(), connection, data.compositor_scaling());
     server_state.run();
 
     // Remove the lifetimes on our fds to avoid borrowing issues, since we know they will exist for
@@ -249,17 +255,45 @@ pub fn main(mut data: impl RunData) -> Option<()> {
             continue;
         }
 
-        match poll(&mut fds, None) {
-            Ok(_) => {
-                if !fds[3].revents().is_empty() {
-                    let status = xwayland_exit_code(&mut quit_rx);
-                    if status != ExitStatus::default() {
-                        error!("Xwayland exited early with {status}");
-                    }
-                    return None;
-                }
+        let timeout = xstate.poll_timeout();
+        let is_quit = if !xstate.has_pending_transfers() {
+            let mut poll_fds = [
+                PollFd::from_borrowed_fd(server_fd, PollFlags::IN),
+                PollFd::new(&xsock_wl, PollFlags::IN),
+                PollFd::from_borrowed_fd(display_fd, PollFlags::IN),
+                PollFd::new(&quit_rx, PollFlags::IN),
+                PollFd::new(&ready_rx, PollFlags::IN),
+            ];
+            match poll(&mut poll_fds, timeout.as_ref()) {
+                Ok(_) => !poll_fds[3].revents().is_empty(),
+                Err(other) => panic!("Poll failed: {other:?}"),
             }
-            Err(other) => panic!("Poll failed: {other:?}"),
+        } else {
+            let mut poll_fds = vec![
+                PollFd::from_borrowed_fd(server_fd, PollFlags::IN),
+                PollFd::new(&xsock_wl, PollFlags::IN),
+                PollFd::from_borrowed_fd(display_fd, PollFlags::IN),
+                PollFd::new(&quit_rx, PollFlags::IN),
+                PollFd::new(&ready_rx, PollFlags::IN),
+            ];
+            xstate.collect_poll_fds(&mut poll_fds);
+            match poll(&mut poll_fds, timeout.as_ref()) {
+                Ok(_) => {
+                    let is_quit = !poll_fds[3].revents().is_empty();
+                    let events: Vec<_> = poll_fds.iter().map(|f| f.revents()).collect();
+                    xstate.process_pending_clipboard_transfers(&events);
+                    is_quit
+                }
+                Err(other) => panic!("Poll failed: {other:?}"),
+            }
+        };
+
+        if is_quit {
+            let status = xwayland_exit_code(&mut quit_rx);
+            if status != ExitStatus::default() {
+                error!("Xwayland exited early with {status}");
+            }
+            return None;
         }
     }
 }

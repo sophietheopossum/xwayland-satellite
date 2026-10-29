@@ -18,7 +18,7 @@ use wayland_server::Resource;
 use wayland_server::protocol::{wl_output, wl_pointer};
 use xcb::{Xid, x};
 use xwayland_satellite as xwls;
-use xwayland_satellite::xstate::{MoveResizeDirection, WmSizeHintsFlags, WmState};
+use xwayland_satellite::xstate::{MoveResizeDirection, SetState, WmSizeHintsFlags, WmState};
 use xwls::timespec_from_millis;
 
 #[derive(Default)]
@@ -343,6 +343,30 @@ impl Fixture {
         self.wait_and_dispatch();
         self.testwl.finalize_output(x, y)
     }
+
+    fn set_fractional_output_scale(&mut self, output: &wl_output::WlOutput, scale: f64) {
+        let physical = (1000.0 * scale) as i32;
+        output.mode(wl_output::Mode::Current, physical, physical, 60000);
+        output.scale(scale.ceil() as i32);
+        self.testwl
+            .get_xdg_output(output)
+            .unwrap()
+            .logical_size(1000, 1000);
+        output.done();
+        self.dispatch_until_quiet();
+    }
+
+    fn dispatch_until_quiet(&mut self) {
+        // An output-only DPI update can finish through X11 properties without
+        // producing another Wayland request while no surfaces are mapped.
+        self.testwl.dispatch();
+        let mut fds = [self.pollfd.clone()];
+        let timeout = timespec_from_millis(50);
+        while poll(&mut fds, Some(&timeout)).unwrap() > 0 {
+            self.testwl.dispatch();
+            self.pollfd.clear_revents();
+        }
+    }
 }
 
 xcb::atoms_struct! {
@@ -352,6 +376,9 @@ xcb::atoms_struct! {
         wm_delete_window => b"WM_DELETE_WINDOW",
         net_wm_state => b"_NET_WM_STATE",
         skip_taskbar => b"_NET_WM_STATE_SKIP_TASKBAR",
+        maximized_vert => b"_NET_WM_STATE_MAXIMIZED_VERT" only_if_exists = false,
+        maximized_horz => b"_NET_WM_STATE_MAXIMIZED_HORZ" only_if_exists = false,
+        wm_change_state => b"WM_CHANGE_STATE" only_if_exists = false,
         transient_for => b"WM_TRANSIENT_FOR",
         clipboard => b"CLIPBOARD",
         primary => b"PRIMARY",
@@ -1897,6 +1924,66 @@ fn popup_done() {
     assert_eq!(reply.map_state(), x::MapState::Unmapped);
 }
 
+/// A window that merely overlaps a second output must keep the anchor - and
+/// so the X11 position - it already had, and only re-anchor once it actually
+/// leaves the output it was anchored to.
+///
+/// Without this, every `wl_surface.enter` re-anchored the window and rewrote
+/// its X11 offset, so a transient overlap (a window straddling a boundary, a
+/// bounding box sweeping past during an animation) moved the window out from
+/// under the pointer: clicks land offset, and regions of the window stop
+/// responding.
+#[test]
+fn transient_output_overlap_keeps_anchor() {
+    let mut f = Fixture::new();
+    let output1 = f.create_output(0, 0);
+    let output2 = f.create_output(1000, 0);
+    let mut connection = Connection::new(&f.display);
+
+    let window = connection.new_window(connection.root, 0, 0, 200, 200, false);
+    let surface = f.map_as_toplevel(&mut connection, window);
+
+    let root_position = |connection: &Connection| {
+        let tree = connection.get_reply(&x::QueryTree { window });
+        let geo = connection.get_reply(&x::GetGeometry {
+            drawable: x::Drawable::Window(window),
+        });
+        let reply = connection.get_reply(&x::TranslateCoordinates {
+            src_window: tree.parent(),
+            dst_window: connection.root,
+            src_x: geo.x(),
+            src_y: geo.y(),
+        });
+        assert!(reply.same_screen());
+        (reply.dst_x(), reply.dst_y())
+    };
+
+    // Anchored to output1.
+    f.testwl.move_surface_to_output(surface, &output1);
+    f.wait_and_dispatch();
+    let anchored = root_position(&connection);
+
+    // Now also on output2, without leaving output1. The anchor is still
+    // valid, so nothing should move.
+    f.testwl.add_surface_to_output(surface, &output2);
+    f.wait_and_dispatch();
+    assert_eq!(
+        root_position(&connection),
+        anchored,
+        "window re-anchored to an output it had only transiently entered"
+    );
+
+    // Leaving output1 invalidates the anchor for real, so the window
+    // re-anchors to the output it is still on.
+    f.testwl.move_surface_to_output(surface, &output2);
+    f.wait_and_dispatch();
+    assert_eq!(
+        root_position(&connection),
+        (anchored.0 + 1000, anchored.1),
+        "window did not re-anchor after leaving the output it was anchored to"
+    );
+}
+
 #[test]
 fn negative_output_coordinates() {
     let mut f = Fixture::new();
@@ -2242,8 +2329,12 @@ fn xsettings_fractional_scale() {
     f.testwl.enable_xdg_output_manager();
     let output = f.create_output(0, 0); // WL-1
 
+    // Output DPI must reach XSETTINGS before any surface enters the monitor.
+    f.set_fractional_output_scale(&output, 1.5);
+    assert_eq!(connection.get_xsettings().data["Xft/DPI"].value, 144 * 1024);
+
     let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
-    let surface = f.map_as_toplevel(&mut connection, window);
+    let surface = f.map_as_toplevel_with_scale(&mut connection, window, 1.5);
 
     let data = f
         .testwl
@@ -2275,6 +2366,14 @@ fn xsettings_fractional_scale() {
     fractional.preferred_scale(300); // 2.5 scale
     f.wait_and_dispatch();
 
+    // Surface preferences size the viewport, not the global X11 settings.
+    let settings = connection.get_xsettings();
+    assert_eq!(settings.data["Xft/DPI"].value, 144 * 1024);
+    assert_eq!(settings.data["Gdk/WindowScalingFactor"].value, 1);
+    assert_eq!(settings.data["Gdk/UnscaledDPI"].value, 144 * 1024);
+
+    f.set_fractional_output_scale(&output, 2.5);
+
     let settings = connection.get_xsettings();
     assert_eq!(
         settings.data["Xft/DPI"].value,
@@ -2304,8 +2403,15 @@ fn resource_manager_scale() {
         b"Xcursor.theme:\tAdwaita\nXft.dpi:\t96\n",
     );
 
+    // Preserve unrelated resources while updating DPI without a mapped window.
+    f.set_fractional_output_scale(&output, 1.5);
+    assert_eq!(
+        connection.get_resource_manager(),
+        b"Xcursor.theme:\tAdwaita\nXft.dpi:\t144\n"
+    );
+
     let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
-    let surface = f.map_as_toplevel(&mut connection, window);
+    let surface = f.map_as_toplevel_with_scale(&mut connection, window, 1.5);
     let data = f.testwl.get_surface_data(surface).unwrap();
     let fractional = data.fractional.as_ref().unwrap();
 
@@ -2321,6 +2427,12 @@ fn resource_manager_scale() {
     let fractional = data.fractional.as_ref().unwrap();
     fractional.preferred_scale(300); // 2.5 scale
     f.wait_and_dispatch();
+    assert_eq!(
+        connection.get_resource_manager(),
+        b"Xcursor.theme:\tAdwaita\nXft.dpi:\t144\n"
+    );
+
+    f.set_fractional_output_scale(&output, 2.5);
     assert_eq!(
         connection.get_resource_manager(),
         b"Xcursor.theme:\tAdwaita\nXft.dpi:\t240\n"
@@ -2511,4 +2623,117 @@ fn client_init_resize() {
         "Got wrong resizing edge: {:?}",
         data.resizing
     );
+}
+
+/// EWMH lets clients leave the button field unspecified (0), which is what every
+/// Chromium/Electron app does when dragging its titlebar.
+#[test]
+fn client_init_move_unspecified_button() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let win_toplevel = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    let surface = f.map_as_toplevel(&mut connection, win_toplevel);
+    connection.get_button_press_events(win_toplevel);
+    f.testwl.move_pointer_to(surface, 10., 10.);
+    let ptr = f.testwl.pointer();
+    ptr.motion(10, 10.0, 10.0);
+    ptr.frame();
+    ptr.button(10, 20, BTN_LEFT, wl_pointer::ButtonState::Pressed);
+    ptr.frame();
+    f.testwl.dispatch();
+    let press = connection.await_button_press();
+    assert_eq!(press.event(), win_toplevel);
+    assert_eq!(press.detail(), 1);
+
+    connection.send_client_message(&x::ClientMessageEvent::new(
+        win_toplevel,
+        connection.atoms.moveresize,
+        x::ClientMessageData::Data32([0, 0, MoveResizeDirection::Move.into(), 0, 0]),
+    ));
+
+    f.wait_and_dispatch();
+    let data = f.testwl.get_surface_data(surface).unwrap();
+    assert!(data.moving);
+}
+
+#[test]
+fn client_maximize() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let win_toplevel = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    let surface = f.map_as_toplevel(&mut connection, win_toplevel);
+
+    let set_maximized = |f: &mut Fixture, action: SetState| {
+        connection.send_client_message(&x::ClientMessageEvent::new(
+            win_toplevel,
+            connection.atoms.net_wm_state,
+            x::ClientMessageData::Data32([
+                action as u32,
+                connection.atoms.maximized_vert.resource_id(),
+                connection.atoms.maximized_horz.resource_id(),
+                0,
+                0,
+            ]),
+        ));
+        f.wait_and_dispatch();
+
+        let maximized = f
+            .testwl
+            .get_surface_data(surface)
+            .unwrap()
+            .toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized);
+
+        // The compositor's answer has to make it back onto _NET_WM_STATE, or the client
+        // will keep drawing itself (titlebar buttons included) as if it were unmaximized.
+        let reply = connection.get_reply(&x::GetProperty {
+            delete: false,
+            window: win_toplevel,
+            property: connection.atoms.net_wm_state,
+            r#type: x::ATOM_ATOM,
+            long_offset: 0,
+            long_length: 8,
+        });
+        let states = reply.value::<x::Atom>();
+        assert_eq!(
+            states.contains(&connection.atoms.maximized_vert),
+            maximized,
+            "_NET_WM_STATE ({states:?}) disagrees with the toplevel state"
+        );
+        assert_eq!(
+            states.contains(&connection.atoms.maximized_horz),
+            maximized,
+            "_NET_WM_STATE ({states:?}) disagrees with the toplevel state"
+        );
+
+        maximized
+    };
+
+    assert!(set_maximized(&mut f, SetState::Add));
+    assert!(!set_maximized(&mut f, SetState::Remove));
+    assert!(set_maximized(&mut f, SetState::Toggle));
+    assert!(!set_maximized(&mut f, SetState::Toggle));
+}
+
+#[test]
+fn client_minimize() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let win_toplevel = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    let surface = f.map_as_toplevel(&mut connection, win_toplevel);
+    assert!(!f.testwl.get_surface_data(surface).unwrap().minimized);
+
+    // This is what XIconifyWindow sends.
+    connection.send_client_message(&x::ClientMessageEvent::new(
+        win_toplevel,
+        connection.atoms.wm_change_state,
+        x::ClientMessageData::Data32([WmState::Iconic as u32, 0, 0, 0, 0]),
+    ));
+
+    f.wait_and_dispatch();
+    assert!(f.testwl.get_surface_data(surface).unwrap().minimized);
 }

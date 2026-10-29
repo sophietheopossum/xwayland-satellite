@@ -1,3 +1,4 @@
+mod cursor_theme;
 mod settings;
 use settings::Settings;
 mod selection;
@@ -111,6 +112,19 @@ pub struct XState {
     selection_state: SelectionState,
     settings: Settings,
     max_req_bytes: usize,
+    // List of mapped managed windows in stacking order
+    client_windows: Vec<x::Window>,
+    /// Cursor names already looked up, by atom.
+    cursor_names: HashMap<u32, String>,
+    /// Name of the cursor displayed at startup, handed to the server on the
+    /// first event pass (XFixes only reports later changes).
+    initial_cursor_name: Option<Option<String>>,
+    /// Theme cursor images by hash. Reading the themes takes a noticeable
+    /// moment, so it is built on a background thread started at startup;
+    /// unnamed cursors keep their image until it is ready.
+    cursor_image_index: std::sync::Arc<std::sync::OnceLock<cursor_theme::CursorImageIndex>>,
+    /// Names recognized from the images of unnamed cursors, by XFixes serial.
+    recognized_cursors: HashMap<u32, Option<&'static str>>,
 }
 
 impl XState {
@@ -163,10 +177,10 @@ impl XState {
             })
             .unwrap();
 
-        // negotiate xfixes version
+        // negotiate xfixes version (2 for cursor names)
         let reply = connection
             .wait_for_reply(connection.send_request(&xcb::xfixes::QueryVersion {
-                client_major_version: 1,
+                client_major_version: 2,
                 client_minor_version: 0,
             }))
             .unwrap();
@@ -202,6 +216,7 @@ impl XState {
                     | SelectionEventMask::SELECTION_CLIENT_CLOSE,
             })
             .unwrap();
+        let mut initial_cursor_name = None;
         {
             // Setup default cursor theme
             let ctx = CursorContext::new(&connection, screen).unwrap();
@@ -212,6 +227,26 @@ impl XState {
                     value_list: &[x::Cw::Cursor(left_ptr)],
                 })
                 .unwrap();
+            // xcb-cursor does not name what it loads (libXcursor does); name it
+            // so it can be forwarded as a cursor shape like any themed cursor.
+            if reply.major_version() >= 2 {
+                connection.send_request(&xcb::xfixes::SetCursorName {
+                    cursor: left_ptr,
+                    name: b"left_ptr",
+                });
+                // Report the name of the displayed cursor whenever it changes.
+                connection
+                    .send_and_check_request(&xcb::xfixes::SelectCursorInput {
+                        window: root,
+                        event_mask: xcb::xfixes::CursorNotifyMask::DISPLAY_CURSOR,
+                    })
+                    .unwrap();
+                initial_cursor_name = connection
+                    .wait_for_reply(connection.send_request(&xcb::xfixes::GetCursorImageAndName {}))
+                    .ok()
+                    .map(|reply| reply.name().to_utf8().into_owned())
+                    .map(|name| (!name.is_empty()).then_some(name));
+            }
         }
 
         let wm_window = connection.generate_id();
@@ -231,9 +266,16 @@ impl XState {
             selection_state,
             settings,
             max_req_bytes,
+            client_windows: Vec::new(),
+            cursor_names: HashMap::new(),
+            initial_cursor_name,
+            cursor_image_index: Default::default(),
+            recognized_cursors: HashMap::new(),
         };
+        r.start_cursor_image_index();
         r.create_ewmh_window();
         r.set_xsettings_owner();
+        r.update_global_scale(1.0);
         r
     }
 
@@ -266,6 +308,33 @@ impl XState {
             .unwrap();
     }
 
+    fn update_client_list(&self) {
+        // Republish _NET_CLIENT_LIST and _NET_CLIENT_LIST_STACKING on the root window
+        self.set_root_property(self.atoms.client_list, x::ATOM_WINDOW, &self.client_windows);
+
+        let stacking = match self.connection.wait_for_reply(
+            self.connection
+                .send_request(&x::QueryTree { window: self.root }),
+        ) {
+            Ok(reply) => reply
+                .children()
+                .iter()
+                .copied()
+                .filter(|w| self.client_windows.contains(w))
+                .collect(),
+            Err(_) => self.client_windows.clone(),
+        };
+        self.set_root_property(self.atoms.client_list_stacking, x::ATOM_WINDOW, &stacking);
+    }
+
+    fn remove_client(&mut self, window: x::Window) {
+        if let Some(pos) = self.client_windows.iter().position(|w| *w == window) {
+            // Drop a window from the client list
+            self.client_windows.remove(pos);
+            self.update_client_list();
+        }
+    }
+
     fn create_ewmh_window(&mut self) {
         self.connection
             .send_and_check_request(&x::CreateWindow {
@@ -285,14 +354,25 @@ impl XState {
 
         self.set_root_property(self.atoms.wm_check, x::ATOM_WINDOW, &[self.wm_window]);
         self.set_root_property(self.atoms.active_win, x::ATOM_WINDOW, &[x::Window::none()]);
+        // Publish the lists empty up front: with no X11 client mapped yet they
+        // were missing altogether, which tools report as "not found" rather
+        // than as an empty desktop.
+        self.set_root_property::<x::Window>(self.atoms.client_list, x::ATOM_WINDOW, &[]);
+        self.set_root_property::<x::Window>(self.atoms.client_list_stacking, x::ATOM_WINDOW, &[]);
         self.set_root_property(
             self.atoms.supported,
             x::ATOM_ATOM,
             &[
+                self.atoms.wm_check,
+                self.atoms.net_wm_name,
                 self.atoms.active_win,
+                self.atoms.client_list,
+                self.atoms.client_list_stacking,
                 self.atoms.motif_wm_hints,
                 self.atoms.net_wm_state,
                 self.atoms.wm_fullscreen,
+                self.atoms.wm_maximized_vert,
+                self.atoms.wm_maximized_horz,
                 self.atoms.moveresize,
             ],
         );
@@ -342,6 +422,11 @@ impl XState {
         }
 
         let mut handled = false;
+
+        if let Some(name) = self.initial_cursor_name.take() {
+            server_state.set_x_cursor_name(name.as_deref());
+        }
+
         let mut ignored_windows = Vec::new();
         while let Some(event) = self.connection.poll_for_event().unwrap() {
             handled = true;
@@ -426,6 +511,12 @@ impl XState {
                             data: &[WmState::Normal as u32, x::Window::none().resource_id()],
                         }
                     ));
+
+                    // Skip unmanaged override-redirect windows in the client list
+                    if !e.override_redirect() && !self.client_windows.contains(&e.window()) {
+                        self.client_windows.push(e.window());
+                        self.update_client_list();
+                    }
                 }
                 xcb::Event::X(x::Event::ConfigureNotify(e)) => {
                     server_state.reconfigure_window(e);
@@ -433,6 +524,7 @@ impl XState {
                 xcb::Event::X(x::Event::UnmapNotify(e)) => {
                     trace!("unmap event: {:?}", e.event());
                     server_state.unmap_window(e.window());
+                    self.remove_client(e.window());
                     let active_win = self
                         .connection
                         .wait_for_reply(self.get_property_cookie(
@@ -449,26 +541,29 @@ impl XState {
                         server_state.connection.focus_window(restore_to, None);
                     }
 
-                    unwrap_or_skip_bad_window_cont!(self.connection.send_and_check_request(
-                        &x::ChangeWindowAttributes {
-                            window: e.window(),
-                            value_list: &[x::Cw::EventMask(x::EventMask::empty())],
-                        }
-                    ));
+                    if !server_state.is_override_redirect(e.window()) {
+                        unwrap_or_skip_bad_window_cont!(self.connection.send_and_check_request(
+                            &x::ChangeWindowAttributes {
+                                window: e.window(),
+                                value_list: &[x::Cw::EventMask(x::EventMask::empty())],
+                            }
+                        ));
 
-                    unwrap_or_skip_bad_window_cont!(self.connection.send_and_check_request(
-                        &x::ChangeProperty {
-                            mode: x::PropMode::Replace,
-                            window: e.window(),
-                            property: self.atoms.wm_state,
-                            r#type: self.atoms.wm_state,
-                            data: &[WmState::Withdrawn as u32, x::Window::none().resource_id()],
-                        }
-                    ));
+                        unwrap_or_skip_bad_window_cont!(self.connection.send_and_check_request(
+                            &x::ChangeProperty {
+                                mode: x::PropMode::Replace,
+                                window: e.window(),
+                                property: self.atoms.wm_state,
+                                r#type: self.atoms.wm_state,
+                                data: &[WmState::Withdrawn as u32, x::Window::none().resource_id()],
+                            }
+                        ));
+                    }
                 }
                 xcb::Event::X(x::Event::DestroyNotify(e)) => {
                     debug!("destroying window {:?}", e.window());
                     server_state.destroy_window(e.window());
+                    self.remove_client(e.window());
                 }
                 xcb::Event::X(x::Event::PropertyNotify(e)) => {
                     if ignored_windows.contains(&e.window()) {
@@ -503,11 +598,38 @@ impl XState {
                             value_list: &list,
                         }
                     ));
+
+                    // ICCCM 4.1.5: a window manager that intercepts a
+                    // ConfigureRequest must tell the client the resulting
+                    // geometry with a synthetic ConfigureNotify. The X server
+                    // only generates a real ConfigureNotify when the geometry
+                    // actually changes, and it frequently does not here: the
+                    // compositor has usually already configured the window to
+                    // the size the client is now asking for (a toplevel
+                    // entering fullscreen gets its output-sized configure the
+                    // moment it requests _NET_WM_STATE_FULLSCREEN, before the
+                    // client's own resize arrives). Wine ≥ 10 tracks every
+                    // request it sends by serial and refuses to send any
+                    // further _NET_WM_STATE, _MOTIF_WM_HINTS or configure
+                    // request until a ConfigureNotify at or after that serial
+                    // arrives, so without this event a Proton game that
+                    // entered fullscreen could never leave it (or re-enter it)
+                    // again — every later state change was "delaying request"
+                    // inside winex11 until some unrelated compositor-driven
+                    // configure happened to produce a notify.
+                    self.send_synthetic_configure_notify(e.window());
                 }
                 xcb::Event::X(x::Event::ClientMessage(e)) => {
                     self.handle_client_message(e, server_state);
                 }
                 xcb::Event::X(x::Event::MappingNotify(_)) => {}
+                xcb::Event::XFixes(xcb::xfixes::Event::CursorNotify(e)) => {
+                    let name = match self.cursor_name(e.name()) {
+                        Some(name) => Some(name),
+                        None => self.recognize_cursor(e.cursor_serial()).map(str::to_owned),
+                    };
+                    server_state.set_x_cursor_name(name.as_deref());
+                }
                 xcb::Event::RandR(xcb::randr::Event::Notify(e))
                     if matches!(e.u(), xcb::randr::NotifyData::Rc(_)) =>
                 {
@@ -521,6 +643,146 @@ impl XState {
             server_state.run();
         }
         handled
+    }
+
+    /// Tell `window` its current geometry with a synthetic ConfigureNotify,
+    /// as ICCCM 4.1.5 requires from a window manager after a ConfigureRequest.
+    fn send_synthetic_configure_notify(&self, window: x::Window) {
+        let cookie = self.connection.send_request(&x::GetGeometry {
+            drawable: x::Drawable::Window(window),
+        });
+        let geometry = match self.connection.wait_for_reply(cookie) {
+            Ok(geometry) => geometry,
+            Err(e) => {
+                debug!("GetGeometry failed for synthetic ConfigureNotify ({window:?}: {e:?})");
+                return;
+            }
+        };
+        let event = x::ConfigureNotifyEvent::new(
+            window,
+            window,
+            x::Window::none(),
+            geometry.x(),
+            geometry.y(),
+            geometry.width(),
+            geometry.height(),
+            geometry.border_width(),
+            false,
+        );
+        if let Err(e) = self.connection.send_and_check_request(&x::SendEvent {
+            propagate: false,
+            destination: x::SendEventDest::Window(window),
+            event_mask: x::EventMask::STRUCTURE_NOTIFY,
+            event: &event,
+        }) {
+            debug!("synthetic ConfigureNotify failed ({window:?}: {e:?})");
+        }
+    }
+
+    /// The XFixes name of a cursor, `None` for an unnamed one.
+    fn cursor_name(&mut self, atom: x::Atom) -> Option<String> {
+        if atom == x::ATOM_NONE {
+            return None;
+        }
+        let connection = &self.connection;
+        Some(
+            self.cursor_names
+                .entry(atom.resource_id())
+                .or_insert_with(|| get_atom_name(connection, atom))
+                .clone(),
+        )
+    }
+
+    /// Name an unnamed cursor by matching its image against the cursor themes
+    /// (see `cursor_theme`).
+    fn recognize_cursor(&mut self, serial: u32) -> Option<&'static str> {
+        /// Bound on remembered cursors; animated cursors create new ones.
+        const MAX_RECOGNIZED: usize = 4096;
+
+        if let Some(name) = self.recognized_cursors.get(&serial) {
+            return *name;
+        }
+        // Not ready yet: keep the image, and try again when this cursor is
+        // displayed next.
+        let index = self.cursor_image_index.clone();
+        let index = index.get()?;
+        let reply = self
+            .connection
+            .wait_for_reply(
+                self.connection
+                    .send_request(&xcb::xfixes::GetCursorImage {}),
+            )
+            .ok()?;
+        // The cursor may have changed again since the event was sent; a later
+        // event covers the new one.
+        if reply.cursor_serial() != serial {
+            return None;
+        }
+        let hash = cursor_theme::image_hash(
+            reply.width().into(),
+            reply.height().into(),
+            reply.cursor_image(),
+        );
+        let name = index.lookup(hash);
+        debug!("unnamed cursor {serial} recognized as {name:?}");
+        if self.recognized_cursors.len() >= MAX_RECOGNIZED {
+            self.recognized_cursors.clear();
+        }
+        self.recognized_cursors.insert(serial, name);
+        name
+    }
+
+    fn start_cursor_image_index(&self) {
+        let themes = cursor_theme::candidate_themes(&self.resource_manager_string());
+        let index = self.cursor_image_index.clone();
+        let spawned = std::thread::Builder::new()
+            .name("cursor-theme-index".into())
+            .spawn(move || {
+                let search_path = cursor_theme::search_path();
+                let built = cursor_theme::CursorImageIndex::build(
+                    &themes,
+                    crate::server::cursor_shape::known_x_cursor_names(),
+                    &search_path,
+                    |a, b| {
+                        let shape = crate::server::cursor_shape::shape_for_x_cursor_name;
+                        shape(a) == shape(b)
+                    },
+                );
+                let _ = index.set(built);
+            });
+        if let Err(err) = spawned {
+            warn!("could not start the cursor theme index: {err}");
+        }
+    }
+
+    /// The root window's RESOURCE_MANAGER string (empty if unset).
+    fn resource_manager_string(&self) -> String {
+        self.connection
+            .wait_for_reply(self.connection.send_request(&x::GetProperty {
+                delete: false,
+                window: self.root,
+                property: self.atoms.resource_manager,
+                r#type: x::ATOM_STRING,
+                long_offset: 0,
+                long_length: u32::MAX,
+            }))
+            .ok()
+            .filter(|reply| reply.r#type() == x::ATOM_STRING)
+            .map(|reply| String::from_utf8_lossy(reply.value::<u8>()).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Write `WM_STATE = NormalState` on `window`.
+    fn set_wm_state_normal(&self, window: x::Window) {
+        if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
+            mode: x::PropMode::Replace,
+            window,
+            property: self.atoms.wm_state,
+            r#type: self.atoms.wm_state,
+            data: &[WmState::Normal as u32, x::Window::none().resource_id()],
+        }) {
+            debug!("WM_STATE update failed ({window:?}: {e:?})");
+        }
     }
 
     fn handle_client_message(
@@ -554,17 +816,62 @@ impl XState {
 
                 trace!("_NET_WM_STATE ({action:?}) props: {prop1:?} {prop2:?}");
 
+                // Maximization is two separate states in EWMH, but xdg-shell only has a
+                // single one, so collapse a request touching either axis into one call -
+                // otherwise a Toggle naming both axes would cancel itself out.
+                let mut maximize = false;
                 for prop in [prop1, prop2] {
                     match prop {
                         x if x == self.atoms.wm_fullscreen => {
                             server_state.set_fullscreen(e.window(), action);
                         }
+                        x if x == self.atoms.wm_maximized_vert
+                            || x == self.atoms.wm_maximized_horz =>
+                        {
+                            maximize = true;
+                        }
                         _ => {}
                     }
                 }
+                if maximize {
+                    server_state.set_maximized(e.window(), action);
+                }
+            }
+            x if x == self.atoms.wm_change_state => {
+                let x::ClientMessageData::Data32(data) = e.data() else {
+                    unreachable!();
+                };
+                match WmState::try_from(data[0]) {
+                    // xdg-shell has no way to ask for the inverse of set_minimized, so
+                    // NormalState (i.e. deiconify) is something we can't act on.
+                    Ok(WmState::Iconic) => {
+                        server_state.minimize_window(e.window());
+                        // Answer the request on WM_STATE. Wine ≥ 9 records
+                        // the XIconifyWindow it just sent and refuses to send
+                        // any other window-state request (fullscreen,
+                        // maximize, configure) until the WM changes WM_STATE
+                        // in reply, so a game that iconifies itself on focus
+                        // loss — Source engine titles do — would otherwise be
+                        // unable to leave or enter fullscreen until something
+                        // unrelated (a focus change) made us rewrite the
+                        // property. xdg-shell neither confirms the minimize
+                        // nor reports the restore, so IconicState would be a
+                        // claim we could never take back; re-asserting
+                        // NormalState is the one answer that stays true from
+                        // the client's point of view and it unblocks Wine.
+                        self.set_wm_state_normal(e.window());
+                    }
+                    Ok(state) => {
+                        debug!("ignoring WM_CHANGE_STATE to {state:?} for {:?}", e.window())
+                    }
+                    Err(_) => warn!("unknown state for WM_CHANGE_STATE: {}", data[0]),
+                }
             }
             x if x == self.atoms.active_win => {
-                server_state.activate_window(e.window());
+                let win = e.window();
+                if win != self.root && win != x::WINDOW_NONE {
+                    server_state.activate_window(win);
+                }
             }
             x if x == self.atoms.moveresize => {
                 let x::ClientMessageData::Data32(data) = e.data() else {
@@ -576,10 +883,31 @@ impl XState {
                     warn!("unknown direction for _NET_WM_MOVERESIZE: {}", data[2]);
                     return;
                 };
+                match direction {
+                    MoveResizeDirection::Cancel => {
+                        // xdg-shell gives us no way to abort a move/resize grab - the
+                        // compositor ends it on button release by itself - so there is
+                        // nothing to forward. GTK sends this after every drag, so don't
+                        // let it fall through to the warning below.
+                        debug!("ignoring move/resize cancel for {:?}", e.window());
+                        return;
+                    }
+                    MoveResizeDirection::SizeKeyboard | MoveResizeDirection::MoveKeyboard => {
+                        warn!(
+                            "Unimplemented window move/resize action: {direction:?} ({:?})",
+                            e.window()
+                        );
+                        return;
+                    }
+                    _ => {}
+                }
+
+                // EWMH lets a client pass 0 to mean the button is unspecified, which is
+                // what Chromium and Electron do for every titlebar drag - GTK passes the
+                // real button instead. Any other button isn't something we drive an
+                // interactive move/resize with.
                 let button = data[3];
-                // XXX: This can technically be driven by keyboard events and other mouse buttons as well,
-                // but I haven't found an application that does this yet. We'll cross that bridge when we get to it.
-                if button != 1 {
+                if button != 0 && button != 1 {
                     warn!(
                         "Attempted move/resize of {:?} with non left click button ({button})",
                         e.window()
@@ -603,12 +931,7 @@ impl XState {
                     }
                     MoveResizeDirection::SizeKeyboard
                     | MoveResizeDirection::MoveKeyboard
-                    | MoveResizeDirection::Cancel => {
-                        warn!(
-                            "Unimplemented window move/resize action: {direction:?} ({:?})",
-                            e.window()
-                        );
-                    }
+                    | MoveResizeDirection::Cancel => unreachable!(),
                 }
             }
             t => warn!(
@@ -655,6 +978,17 @@ impl XState {
             server_state.set_win_hints(window, hints);
         }
 
+        if let Ok(Some(states)) = self.get_net_wm_state(window) {
+            if states.contains(&self.atoms.wm_maximized_vert)
+                || states.contains(&self.atoms.wm_maximized_horz)
+            {
+                server_state.set_win_maximized(window, true);
+            }
+            if states.contains(&self.atoms.wm_fullscreen) {
+                server_state.set_win_fullscreen(window, true);
+            }
+        }
+
         let transient_for = self.get_transient_for(window)?;
         let override_redirect = self.get_override_redirect(window)?;
         server_state.set_override_redirect(window, override_redirect);
@@ -662,6 +996,15 @@ impl XState {
         let window_types = self
             .get_net_wm_window_types(window)?
             .unwrap_or_else(Vec::new);
+
+        let is_menu = window_types.iter().any(|&atom| {
+            atom == self.window_atoms.dropdown_menu
+                || atom == self.window_atoms.popup_menu
+                || atom == self.window_atoms.menu
+                || atom == self.window_atoms.tooltip
+                || atom == self.window_atoms.combo
+        });
+        server_state.set_win_is_menu(window, is_menu);
 
         let heuristics = WindowRoleHeuristics {
             override_redirect,
@@ -759,6 +1102,12 @@ impl XState {
 
     fn get_protocols(&self, window: x::Window) -> XResult<Option<Vec<x::Atom>>> {
         let cookie = self.get_property_cookie(window, self.atoms.wm_protocols, x::ATOM_ATOM, 10);
+        let resolver = |reply: x::GetPropertyReply| reply.value::<x::Atom>().to_vec();
+        PropertyCookieWrapper::new(&self.connection, cookie).resolve(resolver)
+    }
+
+    fn get_net_wm_state(&self, window: x::Window) -> XResult<Option<Vec<x::Atom>>> {
+        let cookie = self.get_property_cookie(window, self.atoms.net_wm_state, x::ATOM_ATOM, 1024);
         let resolver = |reply: x::GetPropertyReply| reply.value::<x::Atom>().to_vec();
         PropertyCookieWrapper::new(&self.connection, cookie).resolve(resolver)
     }
@@ -878,6 +1227,15 @@ impl XState {
                     server_state.set_win_decorations(window, decorations);
                 }
             }
+            x if x == self.atoms.net_wm_state => {
+                if let Ok(Some(states)) = self.get_net_wm_state(window) {
+                    let maximized = states.contains(&self.atoms.wm_maximized_vert)
+                        || states.contains(&self.atoms.wm_maximized_horz);
+                    let fullscreen = states.contains(&self.atoms.wm_fullscreen);
+                    server_state.set_win_maximized(window, maximized);
+                    server_state.set_win_fullscreen(window, fullscreen);
+                }
+            }
             _ => {
                 if log::log_enabled!(log::Level::Debug) {
                     debug!(
@@ -908,8 +1266,12 @@ xcb::atoms_struct! {
         wm_pid => b"_NET_WM_PID" only_if_exists = false,
         net_wm_state => b"_NET_WM_STATE" only_if_exists = false,
         wm_fullscreen => b"_NET_WM_STATE_FULLSCREEN" only_if_exists = false,
+        wm_maximized_vert => b"_NET_WM_STATE_MAXIMIZED_VERT" only_if_exists = false,
+        wm_maximized_horz => b"_NET_WM_STATE_MAXIMIZED_HORZ" only_if_exists = false,
+        wm_change_state => b"WM_CHANGE_STATE" only_if_exists = false,
         active_win => b"_NET_ACTIVE_WINDOW" only_if_exists = false,
         client_list => b"_NET_CLIENT_LIST" only_if_exists = false,
+        client_list_stacking => b"_NET_CLIENT_LIST_STACKING" only_if_exists = false,
         supported => b"_NET_SUPPORTED" only_if_exists = false,
         motif_wm_hints => b"_MOTIF_WM_HINTS" only_if_exists = false,
         utf8_string => b"UTF8_STRING" only_if_exists = false,
@@ -1198,6 +1560,13 @@ impl WindowRoleHeuristics {
             match ty {
                 x if x == window_atoms.normal => return WindowRole::Toplevel,
                 x if x == window_atoms.dialog => {
+                    let is_steam = self
+                        .wm_class
+                        .as_deref()
+                        .is_some_and(|c| c == "steam" || c == "steamwebhelper");
+                    if is_steam {
+                        return WindowRole::Toplevel;
+                    }
                     return WindowRole::new_basic(
                         self.has_transient_for && motif_no_decor && forced_size,
                     );
@@ -1248,6 +1617,16 @@ pub enum SetState {
     Remove,
     Add,
     Toggle,
+}
+
+impl SetState {
+    pub fn apply(self, current: bool) -> bool {
+        match self {
+            Self::Remove => false,
+            Self::Add => true,
+            Self::Toggle => !current,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive)]
@@ -1335,6 +1714,51 @@ impl RealConnection {
     fn root_window(&self) -> x::Window {
         self.connection.get_setup().roots().next().unwrap().root()
     }
+
+    fn get_net_wm_state(&self, window: x::Window) -> XResult<Option<Vec<x::Atom>>> {
+        let cookie = self.connection.send_request(&x::GetProperty {
+            delete: false,
+            window,
+            property: self.atoms.net_wm_state,
+            r#type: x::ATOM_ATOM,
+            long_offset: 0,
+            long_length: 1024,
+        });
+        let reply = self.connection.wait_for_reply(cookie)?;
+        Ok(Some(reply.value::<x::Atom>().to_vec()))
+    }
+
+    /// Add and remove atoms from a window's `_NET_WM_STATE`, leaving every
+    /// other state already on the property alone. A plain replace would mean
+    /// fullscreen and maximized clobber each other, since they share it.
+    fn update_net_wm_state(&mut self, window: x::Window, add: &[x::Atom], remove: &[x::Atom]) {
+        let current_state = self
+            .get_net_wm_state(window)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let mut new_state: Vec<x::Atom> = current_state
+            .into_iter()
+            .filter(|atom| !remove.contains(atom))
+            .collect();
+        for atom in add {
+            if !new_state.contains(atom) {
+                new_state.push(*atom);
+            }
+        }
+        if let Err(e) = self
+            .connection
+            .send_and_check_request(&x::ChangeProperty::<x::Atom> {
+                mode: x::PropMode::Replace,
+                window,
+                property: self.atoms.net_wm_state,
+                r#type: x::ATOM_ATOM,
+                data: &new_state,
+            })
+        {
+            warn!("Failed to update _NET_WM_STATE on {window:?} ({e})");
+        }
+    }
 }
 
 impl XConnection for RealConnection {
@@ -1361,23 +1785,19 @@ impl XConnection for RealConnection {
     }
 
     fn set_fullscreen(&mut self, window: x::Window, fullscreen: bool) {
-        let data = if fullscreen {
-            std::slice::from_ref(&self.atoms.wm_fullscreen)
+        if fullscreen {
+            self.update_net_wm_state(window, &[self.atoms.wm_fullscreen], &[]);
         } else {
-            &[]
-        };
+            self.update_net_wm_state(window, &[], &[self.atoms.wm_fullscreen]);
+        }
+    }
 
-        if let Err(e) = self
-            .connection
-            .send_and_check_request(&x::ChangeProperty::<x::Atom> {
-                mode: x::PropMode::Replace,
-                window,
-                property: self.atoms.net_wm_state,
-                r#type: x::ATOM_ATOM,
-                data,
-            })
-        {
-            warn!("Failed to set fullscreen state on {window:?} ({e})");
+    fn set_maximized(&mut self, window: x::Window, maximized: bool) {
+        let max_atoms = [self.atoms.wm_maximized_vert, self.atoms.wm_maximized_horz];
+        if maximized {
+            self.update_net_wm_state(window, &max_atoms, &[]);
+        } else {
+            self.update_net_wm_state(window, &[], &max_atoms);
         }
     }
 
@@ -1400,14 +1820,16 @@ impl XConnection for RealConnection {
         }) {
             debug!("ChangeProperty failed ({window:?}: {e:?})");
         }
-        if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
-            mode: x::PropMode::Replace,
-            window,
-            property: self.atoms.wm_state,
-            r#type: self.atoms.wm_state,
-            data: &[WmState::Normal as u32, 0],
-        }) {
-            debug!("ChangeProperty failed ({window:?}: {e:?})");
+        if window != x::WINDOW_NONE {
+            if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
+                mode: x::PropMode::Replace,
+                window,
+                property: self.atoms.wm_state,
+                r#type: self.atoms.wm_state,
+                data: &[WmState::Normal as u32, 0],
+            }) {
+                debug!("ChangeProperty failed ({window:?}: {e:?})");
+            }
         }
 
         if let Some(name) = output_name {
@@ -1420,9 +1842,18 @@ impl XConnection for RealConnection {
                 return;
             }
 
+            let primary_window = if window != x::WINDOW_NONE {
+                window
+            } else {
+                self.root_window()
+            };
+
             if let Err(e) = self
                 .connection
-                .send_and_check_request(&xcb::randr::SetOutputPrimary { window, output })
+                .send_and_check_request(&xcb::randr::SetOutputPrimary {
+                    window: primary_window,
+                    output,
+                })
             {
                 warn!("Couldn't set output {name} as primary: {e:?}");
             } else {
@@ -1454,6 +1885,17 @@ impl XConnection for RealConnection {
             event_mask: x::EventMask::empty(),
             event,
         }));
+    }
+
+    fn focus_popup(&mut self, window: x::Window) {
+        trace!("{window:?} (popup focus)");
+        if let Err(e) = self.connection.send_and_check_request(&x::SetInputFocus {
+            focus: window,
+            revert_to: x::InputFocus::None,
+            time: x::CURRENT_TIME,
+        }) {
+            debug!("SetInputFocus failed ({window:?}: {e:?})");
+        }
     }
 
     fn close_window(&mut self, window: x::Window) {

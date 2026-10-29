@@ -1,9 +1,11 @@
 use super::*;
+use cursor_shape::{PointerCursor, SentCursor};
 use hecs::{CommandBuffer, DynamicBundle};
 use log::{debug, error, trace, warn};
 use macros::simple_event_shunt;
 use std::sync::{Arc, OnceLock};
 use wayland_client::globals::Global;
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::WpCursorShapeDeviceV1;
 use wayland_protocols::{
     wp::{
         fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1,
@@ -65,6 +67,155 @@ use wayland_server::{
     },
 };
 
+impl<S: X11Selection> InnerServerState<S> {
+    /// Record that Xwayland uses `surface` as a cursor image and return the
+    /// hotspot to forward, in logical coordinates.
+    ///
+    /// The image is not attached yet (Xwayland attaches it right after
+    /// `set_cursor`), so this uses the factor the surface's last image needed;
+    /// `WlSurface::Attach` corrects it once the new image's size is known.
+    fn mark_cursor_surface(
+        &mut self,
+        surface: Option<Entity>,
+        owner: event::CursorOwner,
+        serial: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+    ) -> (i32, i32) {
+        let Some(surface) = surface else {
+            return (hotspot_x, hotspot_y);
+        };
+        let scale = self.current_scale;
+        let factor = self
+            .world
+            .get::<&event::CursorSurface>(surface)
+            .ok()
+            .filter(|cursor| cursor.scale == scale)
+            .map_or(scale, |cursor| cursor.factor);
+        let cursor = event::CursorSurface {
+            scale,
+            owner,
+            serial,
+            hotspot: (hotspot_x, hotspot_y),
+            factor,
+        };
+        if self.world.insert(surface, (cursor,)).is_err() {
+            return (hotspot_x, hotspot_y);
+        }
+        cursor.logical_hotspot()
+    }
+
+    /// Record the name of the X cursor now displayed (from XFixes) and resend
+    /// the cursor of every pointer whose shape/image choice it changes.
+    pub(crate) fn set_x_cursor_name(&mut self, name: Option<&str>) {
+        let shape = name.and_then(cursor_shape::shape_for_x_cursor_name);
+        debug!("x cursor name {name:?} -> shape {shape:?}");
+        if shape == self.x_cursor_shape {
+            return;
+        }
+        self.x_cursor_shape = shape;
+        let pointers: Vec<Entity> = self
+            .world
+            .query::<&PointerCursor>()
+            .iter()
+            .map(|(entity, _)| entity)
+            .collect();
+        for pointer in pointers {
+            self.apply_pointer_cursor(pointer);
+        }
+    }
+
+    /// Send the compositor what the X cursor of `pointer` should look like: a
+    /// cursor shape when the displayed X cursor has a known name and the
+    /// compositor supports shapes, otherwise Xwayland's image.
+    fn apply_pointer_cursor(&self, pointer: Entity) {
+        let Ok(mut cursor) = self.world.get::<&mut PointerCursor>(pointer) else {
+            return;
+        };
+        let device = self.world.get::<&WpCursorShapeDeviceV1>(pointer).ok();
+        let wanted = cursor.wanted(self.x_cursor_shape, device.is_some());
+        if cursor.sent == Some((cursor.serial, wanted)) {
+            return;
+        }
+        let Ok(c_pointer) = self.world.get::<&client::wl_pointer::WlPointer>(pointer) else {
+            return;
+        };
+        match wanted {
+            SentCursor::Hidden => c_pointer.set_cursor(cursor.serial, None, 0, 0),
+            SentCursor::Shape(shape) => device.unwrap().set_shape(cursor.serial, shape),
+            SentCursor::Image { surface, hotspot } => {
+                let Ok(c_surface) = self.world.get::<&client::wl_surface::WlSurface>(surface)
+                else {
+                    return;
+                };
+                c_pointer.set_cursor(cursor.serial, Some(&c_surface), hotspot.0, hotspot.1);
+            }
+        }
+        cursor.sent = Some((cursor.serial, wanted));
+    }
+
+    /// Size a cursor surface's viewport for the image being attached, and
+    /// re-send `set_cursor` if the hotspot forwarded earlier assumed the wrong
+    /// factor.
+    fn update_cursor_image(&self, surface: Entity, buffer: Option<&WlBuffer>) {
+        let Ok(mut cursor) = self.world.get::<&mut event::CursorSurface>(surface) else {
+            return;
+        };
+        let size = buffer.and_then(|b| {
+            let entity: Entity = b.data().copied()?;
+            self.world
+                .get::<&event::BufferSize>(entity)
+                .ok()
+                .map(|s| *s)
+        });
+        let sent_hotspot = cursor.logical_hotspot();
+        if let Some(size) = size {
+            cursor.factor =
+                event::CursorSurface::factor_for(cursor.scale, event::cursor_base_size(), size);
+        }
+
+        let viewport = self.world.get::<&WpViewport>(surface).unwrap();
+        match size.and_then(|size| cursor.destination(size)) {
+            Some((width, height)) => viewport.set_destination(width, height),
+            None => viewport.set_destination(-1, -1),
+        }
+
+        let hotspot = cursor.logical_hotspot();
+        if hotspot == sent_hotspot {
+            return;
+        }
+        let c_surface = self
+            .world
+            .get::<&client::wl_surface::WlSurface>(surface)
+            .unwrap();
+        match cursor.owner {
+            event::CursorOwner::Pointer(pointer) => {
+                drop(c_surface);
+                drop(viewport);
+                drop(cursor);
+                let still_current = self
+                    .world
+                    .get::<&mut PointerCursor>(pointer)
+                    .ok()
+                    .filter(|current| current.surface == Some(surface))
+                    .map(|mut current| current.hotspot = hotspot)
+                    .is_some();
+                if still_current {
+                    self.apply_pointer_cursor(pointer);
+                }
+            }
+            event::CursorOwner::TabletTool(tool) => {
+                if let Ok(tool) = self
+                    .world
+                    .get::<&c_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2>(tool)
+                {
+                    tool.set_cursor(cursor.serial, Some(&c_surface), hotspot.0, hotspot.1);
+                }
+            }
+        }
+    }
+}
+
 // noop
 impl<S: X11Selection> Dispatch<WlCallback, ()> for InnerServerState<S> {
     fn request(
@@ -102,6 +253,9 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
             Request::<WlSurface>::Attach { buffer, x, y } => {
                 if buffer.is_none() {
                     trace!("xwayland attached null buffer to {client:?}");
+                }
+                if data.has::<event::CursorSurface>() {
+                    state.update_cursor_image(*entity, buffer.as_ref());
                 }
                 let buffer = buffer.as_ref().map(|b| {
                     let entity: Entity = b.data().copied().unwrap();
@@ -165,13 +319,103 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                     f.destroy();
                     cmd.remove_one::<WpFractionalScaleV1>(*entity);
                 }
+                if let Some(mut active_region) = data.get::<&mut ActiveInputRegion>() {
+                    if let Some(r) = active_region.0.take() {
+                        r.destroy();
+                    }
+                    cmd.remove_one::<ActiveInputRegion>(*entity);
+                }
             }
             Request::<WlSurface>::SetBufferScale { scale } => {
                 client.set_buffer_scale(scale);
             }
             Request::<WlSurface>::SetInputRegion { region } => {
-                let region = region.as_ref().map(|r| r.data().unwrap());
-                client.set_input_region(region);
+                let mut prev_region = data.get::<&mut ActiveInputRegion>();
+                if let Some(r) = region {
+                    let is_popup = data
+                        .get::<&WindowData>()
+                        .map(|d| d.attrs.role.is_popup())
+                        .unwrap_or(false);
+
+                    if is_popup {
+                        client.set_input_region(None);
+                        if let Some(prev) = prev_region.as_mut() {
+                            if let Some(old) = prev.0.take() {
+                                old.destroy();
+                            }
+                        }
+                        drop(prev_region);
+                        return;
+                    }
+
+                    let region_data = r.data::<RegionData>().unwrap();
+                    let ops = region_data.ops.lock().unwrap().clone();
+
+                    let (scale_x, scale_y) = if state.compositor_scaling {
+                        super::event::get_surface_input_scales(&state.world, *entity)
+                    } else {
+                        data.get::<&SurfaceScaleFactor>()
+                            .map(|s| (s.0, s.0))
+                            .unwrap_or((1.0, 1.0))
+                    };
+                    let scale_x = if scale_x > 0.0 { scale_x } else { 1.0 };
+                    let scale_y = if scale_y > 0.0 { scale_y } else { 1.0 };
+
+                    let c_region = state.compositor.create_region(&state.qh, ());
+                    for op in ops {
+                        match op {
+                            RegionOp::Add {
+                                x,
+                                y,
+                                width,
+                                height,
+                            } => {
+                                let sx = (x as f64 / scale_x).round() as i32;
+                                let sy = (y as f64 / scale_y).round() as i32;
+                                let sw = (((x as f64 + width as f64) / scale_x).round() as i32
+                                    - sx)
+                                    .max(0);
+                                let sh = (((y as f64 + height as f64) / scale_y).round() as i32
+                                    - sy)
+                                    .max(0);
+                                c_region.add(sx, sy, sw, sh);
+                            }
+                            RegionOp::Subtract {
+                                x,
+                                y,
+                                width,
+                                height,
+                            } => {
+                                let sx = (x as f64 / scale_x).round() as i32;
+                                let sy = (y as f64 / scale_y).round() as i32;
+                                let sw = (((x as f64 + width as f64) / scale_x).round() as i32
+                                    - sx)
+                                    .max(0);
+                                let sh = (((y as f64 + height as f64) / scale_y).round() as i32
+                                    - sy)
+                                    .max(0);
+                                c_region.subtract(sx, sy, sw, sh);
+                            }
+                        }
+                    }
+                    client.set_input_region(Some(&c_region));
+
+                    if let Some(prev) = prev_region.as_mut() {
+                        if let Some(old) = prev.0.replace(c_region) {
+                            old.destroy();
+                        }
+                    } else {
+                        cmd.insert(*entity, (ActiveInputRegion(Some(c_region)),));
+                    }
+                } else {
+                    client.set_input_region(None);
+                    if let Some(prev) = prev_region.as_mut() {
+                        if let Some(old) = prev.0.take() {
+                            old.destroy();
+                        }
+                    }
+                }
+                drop(prev_region);
             }
             other => warn!("unhandled surface request: {other:?}"),
         }
@@ -183,22 +427,68 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
     }
 }
 
-impl<S: X11Selection> Dispatch<WlRegion, client::wl_region::WlRegion> for InnerServerState<S> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RegionOp {
+    Add {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    Subtract {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct RegionData {
+    pub(super) ops: std::sync::Arc<std::sync::Mutex<Vec<RegionOp>>>,
+}
+
+pub(super) struct ActiveInputRegion(pub(super) Option<client::wl_region::WlRegion>);
+
+impl<S: X11Selection> Dispatch<WlRegion, RegionData> for InnerServerState<S> {
     fn request(
         _: &mut Self,
         _: &wayland_server::Client,
         _: &WlRegion,
         request: <WlRegion as Resource>::Request,
-        client: &client::wl_region::WlRegion,
+        data: &RegionData,
         _: &DisplayHandle,
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
-        macros::simple_event_shunt! {
-            client, request: wl_region::Request => [
-                Add { x, y, width, height },
-                Subtract { x, y, width, height },
-                Destroy
-            ]
+        match request {
+            wl_region::Request::Add {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                data.ops.lock().unwrap().push(RegionOp::Add {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+            }
+            wl_region::Request::Subtract {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                data.ops.lock().unwrap().push(RegionOp::Subtract {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+            }
+            wl_region::Request::Destroy => {}
+            _ => {}
         }
     }
 }
@@ -234,7 +524,9 @@ impl<S: X11Selection>
                         client,
                         server,
                         viewport,
-                        scale: SurfaceScaleFactor(state.current_scale),
+                        scale: SurfaceScaleFactor(state.global_scale),
+                        true_scale: event::TrueFractionalScale(state.global_scale),
+                        entered_outputs: event::EnteredOutputs(Vec::new()),
                     },
                 );
                 if let Some(f) = fractional {
@@ -242,8 +534,8 @@ impl<S: X11Selection>
                 }
             }
             Request::<WlCompositor>::CreateRegion { id } => {
-                let c_region = client.create_region(&state.qh, ());
-                data_init.init(id, c_region);
+                let region_data = RegionData::default();
+                data_init.init(id, region_data);
             }
             other => {
                 warn!("unhandled wlcompositor request: {other:?}");
@@ -303,7 +595,10 @@ impl<S: X11Selection> Dispatch<WlShmPool, client::wl_shm_pool::WlShmPool> for In
                     entity,
                 );
                 let server = data_init.init(id, entity);
-                state.world.spawn_at(entity, (client, server));
+                state.world.spawn_at(
+                    entity,
+                    (client, server, event::BufferSize { width, height }),
+                );
             }
             Request::<WlShmPool>::Resize { size } => {
                 c_pool.resize(size);
@@ -358,23 +653,38 @@ impl<S: X11Selection> Dispatch<WlPointer, Entity> for InnerServerState<S> {
                 hotspot_y,
                 surface,
             } => {
-                let c_pointer = state
+                let surface_entity: Option<Entity> = surface.and_then(|s| s.data().copied());
+                let hotspot = state.mark_cursor_surface(
+                    surface_entity,
+                    event::CursorOwner::Pointer(*entity),
+                    serial,
+                    hotspot_x,
+                    hotspot_y,
+                );
+                let sent = state
                     .world
-                    .get::<&client::wl_pointer::WlPointer>(*entity)
-                    .unwrap();
-
-                let c_surface = surface.and_then(|s| {
-                    let e = s.data().copied()?;
-                    Some(
-                        state
-                            .world
-                            .get::<&client::wl_surface::WlSurface>(e)
-                            .unwrap(),
+                    .get::<&PointerCursor>(*entity)
+                    .ok()
+                    .and_then(|cursor| cursor.sent);
+                state
+                    .world
+                    .insert_one(
+                        *entity,
+                        PointerCursor {
+                            serial,
+                            surface: surface_entity,
+                            hotspot,
+                            sent,
+                        },
                     )
-                });
-                c_pointer.set_cursor(serial, c_surface.as_deref(), hotspot_x, hotspot_y);
+                    .unwrap();
+                state.apply_pointer_cursor(*entity);
             }
             Request::<WlPointer>::Release => {
+                if let Ok(device) = state.world.remove_one::<WpCursorShapeDeviceV1>(*entity) {
+                    device.destroy();
+                }
+                let _ = state.world.remove_one::<PointerCursor>(*entity);
                 let (client, _) = state
                     .world
                     .remove::<(client::wl_pointer::WlPointer, WlPointer)>(*entity)
@@ -451,8 +761,15 @@ impl<S: X11Selection> Dispatch<WlSeat, Entity> for InnerServerState<S> {
                         .unwrap()
                         .get_pointer(&state.qh, *entity)
                 };
+                let shape_device = state
+                    .cursor_shape_manager
+                    .as_ref()
+                    .map(|manager| manager.get_pointer(&client, &state.qh, ()));
                 let server = data_init.init(id, *entity);
                 state.world.insert(*entity, (client, server)).unwrap();
+                if let Some(device) = shape_device {
+                    state.world.insert_one(*entity, device).unwrap();
+                }
             }
             Request::<WlSeat>::GetKeyboard { id } => {
                 let client = {
@@ -634,7 +951,10 @@ impl<S: X11Selection>
                     entity,
                 );
                 let server = data_init.init(buffer_id, entity);
-                state.world.spawn_at(entity, (client, server));
+                state.world.spawn_at(
+                    entity,
+                    (client, server, event::BufferSize { width, height }),
+                );
             }
             Add {
                 fd,
@@ -901,6 +1221,9 @@ impl<S: X11Selection> Dispatch<ConfinedPointerServer, Entity> for InnerServerSta
     }
 }
 
+#[derive(Clone, Copy)]
+struct LockedPointerSurface(Entity);
+
 impl<S: X11Selection> Dispatch<LockedPointerServer, Entity> for InnerServerState<S> {
     fn request(
         state: &mut Self,
@@ -916,17 +1239,27 @@ impl<S: X11Selection> Dispatch<LockedPointerServer, Entity> for InnerServerState
                 surface_x,
                 surface_y,
             } => {
-                let (client, scale) = state
-                    .world
-                    .query_one_mut::<(&LockedPointerClient, &SurfaceScaleFactor)>(*entity)
-                    .unwrap();
+                let surf_key = {
+                    let mut query = state
+                        .world
+                        .query_one::<&LockedPointerSurface>(*entity)
+                        .unwrap();
+                    query.get().unwrap().0
+                };
 
-                // Xwayland believes that the surface is actually <surface scale factor> times bigger
-                // than it currently is, and therefore that the cursor position is also scaled up by the same
-                // amount. So we need to divide the cursor position from Xwayland by the surface scale
-                // to get where the cursor should actually be positioned.
+                let scales = if state.compositor_scaling {
+                    super::event::get_surface_input_scales(&state.world, surf_key)
+                } else {
+                    state
+                        .world
+                        .get::<&SurfaceScaleFactor>(surf_key)
+                        .ok()
+                        .map(|s| (s.0, s.0))
+                        .unwrap_or((1.0, 1.0))
+                };
 
-                client.set_cursor_position_hint(surface_x / scale.0, surface_y / scale.0);
+                let client = state.world.get::<&LockedPointerClient>(*entity).unwrap();
+                client.set_cursor_position_hint(surface_x / scales.0, surface_y / scales.1);
             }
             lp::Request::Destroy => {
                 {
@@ -1019,16 +1352,10 @@ impl<S: X11Selection>
                     )
                 };
                 let server = data_init.init(id, entity);
-                let surface_scale = state
-                    .world
-                    .get::<&SurfaceScaleFactor>(surf_key)
-                    .as_deref()
-                    .copied()
-                    .unwrap();
 
                 state
                     .world
-                    .spawn_at(entity, (client, server, surface_scale));
+                    .spawn_at(entity, (client, server, LockedPointerSurface(surf_key)));
             }
             Request::Destroy => {
                 client.destroy();
@@ -1148,6 +1475,19 @@ impl<S: X11Selection> Dispatch<s_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, En
                 hotspot_y,
             } => {
                 let surf_key: Option<Entity> = surface.map(|s| s.data().copied().unwrap());
+                // Release the tool borrow so the surface can be marked as a cursor.
+                drop(client);
+                let (hotspot_x, hotspot_y) = state.mark_cursor_surface(
+                    surf_key,
+                    event::CursorOwner::TabletTool(*entity),
+                    serial,
+                    hotspot_x,
+                    hotspot_y,
+                );
+                let client = state
+                    .world
+                    .get::<&c_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2>(*entity)
+                    .unwrap();
                 let c_surface = surf_key.map(|key| {
                     state
                         .world
@@ -1478,6 +1818,7 @@ impl<S: X11Selection> GlobalDispatch<WlOutput, Global> for InnerServerState<S> {
                 server,
                 client,
                 event::OutputScaleFactor::Output(1),
+                event::TrueOutputScaleFactor(event::OutputScaleFactor::Output(1)),
                 event::OutputDimensions::default(),
                 GlobalName(data.name),
             ),
