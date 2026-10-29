@@ -87,7 +87,12 @@ Some Java applications may present themselves as a blank screen by default with 
 
 ### Scaling/HiDPI
 For most GTK and Qt apps, xwayland-satellite should automatically scale them properly. Note that for mixed DPI monitor setups, satellite will choose
-the smallest monitor's DPI, meaning apps may have small text on other monitors.
+the smallest monitor's DPI by default, meaning apps may have small text on other monitors.
+
+Alternatively, you can enable compositor-side scaling by setting the `XWAYLAND_SATELLITE_COMPOSITOR_SCALING` environment variable.
+In this mode, satellite will render X11 applications at the maximum monitor's DPI (HiDPI) and let the Wayland compositor downscale them on lower-DPI monitors.
+This ensures that apps do not look tiny or blurry on HiDPI displays in multi-monitor setups.
+You can optionally set `XWAYLAND_SATELLITE_BASE_SCALE` (1.0–8.0) to override the base scale. Setting it to 1.0 keeps native res and saves VRAM without breaking multi-monitor fixes.
 
 With fractional-scale and xdg-output v3 support, monitor DPI is derived from the
 output's physical and logical sizes. Without xdg-output v3, global X11 DPI uses
