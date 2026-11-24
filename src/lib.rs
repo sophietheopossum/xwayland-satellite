@@ -1,5 +1,6 @@
 mod server;
 pub mod xstate;
+pub mod cli;
 
 use crate::server::{NoConnection, PendingSurfaceState, ServerState};
 use crate::xstate::{RealConnection, XState};
